@@ -19,7 +19,11 @@
 #ifndef GPU_SOFT_H
 #define GPU_SOFT_H
 
+#include <atomic>
+#include <memory>
+
 #include "GPU.h"
+#include "Platform.h"
 #include "GPU2D_Soft.h"
 #include "GPU3D_Soft.h"
 
@@ -43,30 +47,128 @@ public:
     void DrawScanline(u32 line) override;
     void DrawSprites(u32 line) override;
 
-    void VBlank() override {};
+    void VBlank() override;
     void VBlankEnd() override {};
 
     void AllocCapture(u32 bank, u32 start, u32 len) override {};
-    void SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete) override {};
+    void SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete) override;
 
     bool GetFramebuffers(void** top, void** bottom) override;
+    void SwapBuffers() override;
 
 private:
     friend class SoftRenderer2D;
     friend class SoftRenderer3D;
+
+    // The 2D renderers read these copies of the 2D engines' state.
+    // Unthreaded, they are refreshed right before drawing;
+    // threaded, the render thread loads them from each job.
+    melonDS::GPU2D State2D_A;
+    melonDS::GPU2D State2D_B;
+    SoftRenderer2D* Soft2D_A;
+    SoftRenderer2D* Soft2D_B;
 
     u32* Framebuffer[2][2];
 
     u32* Output3D;
     alignas(8) u32 Output2D[2][256];
 
-    void DrawScanlineA(u32 line, u32* dst);
-    void DrawScanlineB(u32 line, u32* dst);
+    void RenderScanline(u32 line, u32* dstA, u32* dstB, bool screensEnabled,
+                        const u16* displayLine, u16 brightnessA, u16 brightnessB);
+    void DrawScanlineA(u32 line, u32* dst, const u16* displayLine, u16 brightness);
+    void DrawScanlineB(u32 line, u32* dst, u16 brightness);
 
-    void DoCapture(u32 line);
+    void UpdateBGVRAM(const melonDS::GPU2D& unit);
+    void UpdateOBJVRAM(const melonDS::GPU2D& unit);
+
+    bool CaptureNeeded(u32 line, u32 captureCnt, u32 lcdcMap) const;
+    const u16* CaptureSourceB(u32 line, u32 captureCnt, u32 dispCnt) const;
+    void WriteCapture(u32 line, u32 captureCnt, const u32* srcA, const u16* srcB);
 
     void ApplyMasterBrightness(u16 regval, u32* dst);
     void ExpandColor(u32* dst);
+
+    /*
+        Threaded 2D rendering
+
+        At each DrawScanline/DrawSprites call, the emulation thread queues a job holding everything
+        the 2D renderers read that may change before the render thread gets to it: the 2D engine
+        state, the 3D scanline, the VRAM or FIFO line for display and capture, and the palette and OAM
+        (as references to copies that are only taken when they changed).
+        The flat VRAM copies are shared; when they need updating, the emulation thread first waits
+        until no queued job reads them any more.
+        Display captures are written to VRAM by the emulation thread once their job is done, and at
+        the latest when the capture ends at VBlank or the CPU accesses a captured VRAM block.
+        The frame is complete when the buffers are swapped.
+    */
+
+    struct Job2D
+    {
+        bool Sprites;           // DrawSprites, otherwise DrawScanline
+        bool ScreensEnabled;
+        bool Capture;
+        bool HasDisplayLine;
+        bool HasCaptureB;
+        u32 Line;
+        u32 VCount;
+        u32* DstA;
+        u32* DstB;
+        u16 BrightnessA;
+        u16 BrightnessB;
+        u32 CaptureCnt;
+        u32 PaletteCopy;
+        u32 OAMCopy;
+        GPU2DState State[2];
+
+        alignas(8) u32 Line3D[256];
+        alignas(8) u16 DisplayLine[256];    // VRAM or FIFO display source for engine A
+        alignas(8) u16 CaptureB[256];       // capture source B
+        alignas(8) u32 CaptureA[256];       // capture source A, filled in by the render thread
+    };
+
+    static constexpr u32 NumJobs = 512;
+    static constexpr u32 NumMemCopies = 32;
+
+    bool Threaded2D = false;
+    Platform::Thread* Thread2D = nullptr;
+    Platform::Semaphore* Sema_Work;
+    Platform::Semaphore* Sema_Done;
+    std::atomic<bool> StopThread2D {false};
+    std::atomic<bool> WorkerSleeping {false};
+    std::atomic<bool> EmuWaiting {false};
+
+    // job counts: submitted by the emulation thread, done by the render thread,
+    // retired (captures written) by the emulation thread
+    std::atomic<u32> JobsSubmitted {0};
+    std::atomic<u32> JobsDone {0};
+    u32 JobsRetired = 0;
+
+    // job count that must be reached before the captures to each VRAM bank are all written
+    u32 CaptureJobs[4] {};
+    u32 CaptureLCDCMap = 0;
+    // once the CPU has accessed the capture in progress, GPU stops telling us about further accesses,
+    // so the rest of its scanlines are written right away
+    bool CaptureImmediate = false;
+
+    u32 CurPaletteCopy = 0;
+    u32 CurOAMCopy = 0;
+    u32 PaletteCopyJobs[NumMemCopies] {};
+    u32 OAMCopyJobs[NumMemCopies] {};
+    std::unique_ptr<u8[]> PaletteCopies;
+    std::unique_ptr<u8[]> OAMCopies;
+    std::unique_ptr<Job2D[]> Jobs;
+
+    void SetThreaded2D(bool threaded);
+    void RenderThread2DFunc();
+    void RunJob(Job2D& job);
+
+    Job2D& BeginJob();
+    void SubmitJob();
+    void BeginJobState(Job2D& job);
+    void WaitForJobs(u32 count);
+    void RetireJobs();
+    void WaitIdle();
+    void SyncCaptures(u32 bank);
 };
 
 }

@@ -37,8 +37,14 @@ public:
     void VBlank() override {}
     void VBlankEnd() override {};
 
+    // palette and OAM memory to draw with (the GPU's own, or a copy)
+    void SetMemory(u8* palette, u8* oam) { Palette = palette; OAM = oam; }
+
 private:
     SoftRenderer& Parent;
+
+    u8* Palette;
+    u8* OAM;
 
     enum
     {

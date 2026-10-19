@@ -16,6 +16,9 @@
     with melonDS. If not, see http://www.gnu.org/licenses/.
 */
 
+#include <chrono>
+#include <string.h>
+
 #include "NDS.h"
 #include "GPU_Soft.h"
 #include "GPU_ColorOp.h"
@@ -23,8 +26,42 @@
 namespace melonDS
 {
 
+namespace
+{
+inline void CPURelax()
+{
+#if defined(__aarch64__) || defined(__arm__)
+    asm volatile("yield");
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#endif
+}
+
+// busy-wait for a condition, for at most the given time
+// cheaper than sleeping when the other thread is expected to be quick
+template <typename F>
+bool SpinUntil(F&& done, std::chrono::microseconds limit)
+{
+    auto start = std::chrono::steady_clock::now();
+    for (u32 i = 1;; i++)
+    {
+        if (done())
+            return true;
+
+        CPURelax();
+        if (((i & 0x3F) == 0) && ((std::chrono::steady_clock::now() - start) > limit))
+            return done();
+    }
+}
+
+// how long the render thread waits for the next job before going to sleep
+constexpr std::chrono::microseconds RenderThreadSpin(500);
+// how long the emulation thread waits for the render thread before going to sleep
+constexpr std::chrono::microseconds EmuThreadSpin(100);
+}
+
 SoftRenderer::SoftRenderer(melonDS::NDS& nds)
-    : Renderer(nds.GPU)
+    : Renderer(nds.GPU), State2D_A(0, nds.GPU), State2D_B(1, nds.GPU)
 {
     const size_t len = 256 * 192;
     Framebuffer[0][0] = new u32[len];
@@ -33,13 +70,25 @@ SoftRenderer::SoftRenderer(melonDS::NDS& nds)
     Framebuffer[1][1] = new u32[len];
     BackBuffer = 0;
 
-    Rend2D_A = std::make_unique<SoftRenderer2D>(GPU.GPU2D_A, *this);
-    Rend2D_B = std::make_unique<SoftRenderer2D>(GPU.GPU2D_B, *this);
+    auto rend2D_A = std::make_unique<SoftRenderer2D>(State2D_A, *this);
+    auto rend2D_B = std::make_unique<SoftRenderer2D>(State2D_B, *this);
+    Soft2D_A = rend2D_A.get();
+    Soft2D_B = rend2D_B.get();
+    Rend2D_A = std::move(rend2D_A);
+    Rend2D_B = std::move(rend2D_B);
     Rend3D = std::make_unique<SoftRenderer3D>(GPU.GPU3D, *this);
+
+    Sema_Work = Platform::Semaphore_Create();
+    Sema_Done = Platform::Semaphore_Create();
 }
 
 SoftRenderer::~SoftRenderer()
 {
+    SetThreaded2D(false);
+
+    Platform::Semaphore_Free(Sema_Work);
+    Platform::Semaphore_Free(Sema_Done);
+
     delete[] Framebuffer[0][0];
     delete[] Framebuffer[0][1];
     delete[] Framebuffer[1][0];
@@ -48,6 +97,8 @@ SoftRenderer::~SoftRenderer()
 
 void SoftRenderer::Reset()
 {
+    WaitIdle();
+
     const size_t len = 256 * 192 * sizeof(u32);
     memset(Framebuffer[0][0], 0, len);
     memset(Framebuffer[0][1], 0, len);
@@ -61,6 +112,8 @@ void SoftRenderer::Reset()
 
 void SoftRenderer::Stop()
 {
+    WaitIdle();
+
     // clear framebuffers to black
     const size_t len = 256 * 192 * sizeof(u32);
     memset(Framebuffer[0][0], 0, len);
@@ -72,6 +125,8 @@ void SoftRenderer::Stop()
 
 void SoftRenderer::PreSavestate()
 {
+    WaitIdle();
+
     auto rend3d = dynamic_cast<SoftRenderer3D*>(Rend3D.get());
     if (rend3d->IsThreaded())
         rend3d->SetupRenderThread();
@@ -89,6 +144,8 @@ void SoftRenderer::SetRenderSettings(RendererSettings& settings)
 {
     auto rend3d = dynamic_cast<SoftRenderer3D*>(Rend3D.get());
     rend3d->SetThreaded(settings.Threaded);
+
+    SetThreaded2D(settings.Threaded2D);
 }
 
 
@@ -108,23 +165,166 @@ void SoftRenderer::DrawScanline(u32 line)
     }
 
     // the position used for drawing operations is based on VCOUNT
-    line = GPU.VCount;
-    if (line < 192)
+    u32 vcount = GPU.VCount;
+    u32 dispcnt = GPU.GPU2D_A.DispCnt;
+
+    if (Threaded2D)
+    {
+        Job2D& job = BeginJob();
+        job.Sprites = false;
+        job.Line = line;
+        job.VCount = vcount;
+        job.DstA = dstA;
+        job.DstB = dstB;
+        job.ScreensEnabled = GPU.ScreensEnabled;
+        job.Capture = false;
+
+        if (vcount < 192)
+        {
+            u32* line3D = Rend3D->GetLine(vcount);
+            memcpy(job.Line3D, line3D, sizeof(job.Line3D));
+
+            BeginJobState(job);
+            UpdateBGVRAM(GPU.GPU2D_A);
+            UpdateBGVRAM(GPU.GPU2D_B);
+
+            job.BrightnessA = GPU.MasterBrightnessA;
+            job.BrightnessB = GPU.MasterBrightnessB;
+
+            job.HasDisplayLine = false;
+            switch ((dispcnt >> 16) & 0x3)
+            {
+            case 2: // VRAM display
+                {
+                    u32 vrambank = (dispcnt >> 18) & 0x3;
+                    if (GPU.VRAMMap_LCDC & (1<<vrambank))
+                    {
+                        SyncCaptures(vrambank);
+                        memcpy(job.DisplayLine, &((u16*)GPU.VRAM[vrambank])[vcount * 256], sizeof(job.DisplayLine));
+                        job.HasDisplayLine = true;
+                    }
+                }
+                break;
+
+            case 3: // FIFO display
+                memcpy(job.DisplayLine, GPU.DispFIFOBuffer, sizeof(job.DisplayLine));
+                job.HasDisplayLine = true;
+                break;
+            }
+
+            u32 captureCnt = GPU.CaptureCnt;
+            if (GPU.CaptureEnable && CaptureNeeded(vcount, captureCnt, GPU.VRAMMap_LCDC))
+            {
+                job.Capture = true;
+                job.CaptureCnt = captureCnt;
+                job.HasCaptureB = false;
+
+                if ((captureCnt >> 29) & 0x3)
+                {
+                    // source B may be a VRAM bank that is still being captured to
+                    u32 srcvram = (dispcnt >> 18) & 0x3;
+                    if (!(captureCnt & (1<<25)) && (GPU.VRAMMap_LCDC & (1<<srcvram)))
+                        SyncCaptures(srcvram);
+
+                    const u16* srcB = CaptureSourceB(vcount, captureCnt, dispcnt);
+                    if (srcB)
+                    {
+                        u32 width = (((captureCnt >> 20) & 0x3) == 0) ? 128 : 256;
+                        memcpy(job.CaptureB, srcB, width * sizeof(u16));
+                        job.HasCaptureB = true;
+                    }
+                }
+
+                CaptureJobs[(captureCnt >> 16) & 0x3] = JobsSubmitted.load(std::memory_order_relaxed) + 1;
+                CaptureLCDCMap = GPU.VRAMMap_LCDC;
+            }
+        }
+
+        SubmitJob();
+        if (job.Capture && CaptureImmediate)
+            WaitIdle();
+        return;
+    }
+
+    const u16* displayLine = nullptr;
+    if (vcount < 192)
     {
         // retrieve 3D output
-        Output3D = Rend3D->GetLine(line);
+        Output3D = Rend3D->GetLine(vcount);
 
+        static_cast<GPU2DState&>(State2D_A) = GPU.GPU2D_A;
+        static_cast<GPU2DState&>(State2D_B) = GPU.GPU2D_B;
+        UpdateBGVRAM(State2D_A);
+        UpdateBGVRAM(State2D_B);
+
+        switch ((dispcnt >> 16) & 0x3)
+        {
+        case 2: // VRAM display
+            {
+                u32 vrambank = (dispcnt >> 18) & 0x3;
+                if (GPU.VRAMMap_LCDC & (1<<vrambank))
+                    displayLine = &((u16*)GPU.VRAM[vrambank])[vcount * 256];
+            }
+            break;
+
+        case 3: // FIFO display
+            displayLine = GPU.DispFIFOBuffer;
+            break;
+        }
+    }
+
+    RenderScanline(vcount, dstA, dstB, GPU.ScreensEnabled, displayLine, GPU.MasterBrightnessA, GPU.MasterBrightnessB);
+
+    // perform display capture if enabled
+    if (vcount < 192)
+    {
+        u32 captureCnt = GPU.CaptureCnt;
+        if (GPU.CaptureEnable && CaptureNeeded(vcount, captureCnt, GPU.VRAMMap_LCDC))
+        {
+            const u32* srcA = (captureCnt & (1<<24)) ? Output3D : Output2D[0];
+            WriteCapture(vcount, captureCnt, srcA, CaptureSourceB(vcount, captureCnt, dispcnt));
+        }
+    }
+}
+
+void SoftRenderer::DrawSprites(u32 line)
+{
+    if (Threaded2D)
+    {
+        Job2D& job = BeginJob();
+        job.Sprites = true;
+        job.Line = line;
+        job.Capture = false;
+
+        BeginJobState(job);
+        UpdateOBJVRAM(GPU.GPU2D_A);
+        UpdateOBJVRAM(GPU.GPU2D_B);
+
+        SubmitJob();
+        return;
+    }
+
+    static_cast<GPU2DState&>(State2D_A) = GPU.GPU2D_A;
+    static_cast<GPU2DState&>(State2D_B) = GPU.GPU2D_B;
+    UpdateOBJVRAM(State2D_A);
+    UpdateOBJVRAM(State2D_B);
+
+    Rend2D_A->DrawSprites(line);
+    Rend2D_B->DrawSprites(line);
+}
+
+void SoftRenderer::RenderScanline(u32 line, u32* dstA, u32* dstB, bool screensEnabled,
+                                  const u16* displayLine, u16 brightnessA, u16 brightnessB)
+{
+    if (line < 192)
+    {
         // draw BG/OBJ layers
         Rend2D_A->DrawScanline(line);
         Rend2D_B->DrawScanline(line);
 
         // draw the final screen output
-        DrawScanlineA(line, dstA);
-        DrawScanlineB(line, dstB);
-
-        // perform display capture if enabled
-        if (GPU.CaptureEnable)
-            DoCapture(line);
+        DrawScanlineA(line, dstA, displayLine, brightnessA);
+        DrawScanlineB(line, dstB, brightnessB);
     }
     else
     {
@@ -140,7 +340,7 @@ void SoftRenderer::DrawScanline(u32 line)
         }
     }
 
-    if (GPU.ScreensEnabled)
+    if (screensEnabled)
     {
         // expand the color from 6-bit to 8-bit
         ExpandColor(dstA);
@@ -157,15 +357,9 @@ void SoftRenderer::DrawScanline(u32 line)
     }
 }
 
-void SoftRenderer::DrawSprites(u32 line)
+void SoftRenderer::DrawScanlineA(u32 line, u32* dst, const u16* displayLine, u16 brightness)
 {
-    Rend2D_A->DrawSprites(line);
-    Rend2D_B->DrawSprites(line);
-}
-
-void SoftRenderer::DrawScanlineA(u32 line, u32* dst)
-{
-    u32 dispcnt = GPU.GPU2D_A.DispCnt;
+    u32 dispcnt = State2D_A.DispCnt;
     switch ((dispcnt >> 16) & 0x3)
     {
     case 0: // screen off
@@ -184,15 +378,12 @@ void SoftRenderer::DrawScanlineA(u32 line, u32* dst)
 
     case 2: // VRAM display
         {
-            u32 vrambank = (dispcnt >> 18) & 0x3;
-            if (GPU.VRAMMap_LCDC & (1<<vrambank))
+            // displayLine is only set if the selected bank is mapped to LCDC
+            if (displayLine)
             {
-                u16* vram = (u16*)GPU.VRAM[vrambank];
-                vram = &vram[line * 256];
-
                 for (int i = 0; i < 256; i++)
                 {
-                    u16 color = vram[i];
+                    u16 color = displayLine[i];
                     u8 r = (color & 0x001F) << 1;
                     u8 g = (color & 0x03E0) >> 4;
                     u8 b = (color & 0x7C00) >> 9;
@@ -212,7 +403,7 @@ void SoftRenderer::DrawScanlineA(u32 line, u32* dst)
         {
             for (int i = 0; i < 256; i++)
             {
-                u16 color = GPU.DispFIFOBuffer[i];
+                u16 color = displayLine[i];
                 u8 r = (color & 0x001F) << 1;
                 u8 g = (color & 0x03E0) >> 4;
                 u8 b = (color & 0x7C00) >> 9;
@@ -223,12 +414,12 @@ void SoftRenderer::DrawScanlineA(u32 line, u32* dst)
         break;
     }
 
-    ApplyMasterBrightness(GPU.MasterBrightnessA, dst);
+    ApplyMasterBrightness(brightness, dst);
 }
 
-void SoftRenderer::DrawScanlineB(u32 line, u32* dst)
+void SoftRenderer::DrawScanlineB(u32 line, u32* dst, u16 brightness)
 {
-    u32 dispcnt = GPU.GPU2D_B.DispCnt;
+    u32 dispcnt = State2D_B.DispCnt;
     switch ((dispcnt >> 16) & 0x1)
     {
     case 0: // screen off
@@ -246,61 +437,111 @@ void SoftRenderer::DrawScanlineB(u32 line, u32* dst)
         break;
     }
 
-    ApplyMasterBrightness(GPU.MasterBrightnessB, dst);
+    ApplyMasterBrightness(brightness, dst);
 }
 
-void SoftRenderer::DoCapture(u32 line)
+void SoftRenderer::UpdateBGVRAM(const melonDS::GPU2D& unit)
 {
-    u32 captureCnt = GPU.CaptureCnt;
+    // the BG layers aren't drawn if the 2D engine is disabled or blanked
+    if (!unit.Enabled || unit.ForcedBlank)
+        return;
 
-    u32 width, height;
-    u32 sz = (captureCnt >> 20) & 0x3;
-    if (sz == 0)
+    if (unit.Num == 0)
     {
-        width = 128;
-        height = 128;
+        auto bgDirty = GPU.VRAMDirty_ABG.DeriveState(GPU.VRAMMap_ABG, GPU);
+        auto bgExtPalDirty = GPU.VRAMDirty_ABGExtPal.DeriveState(GPU.VRAMMap_ABGExtPal, GPU);
+        auto objExtPalDirty = GPU.VRAMDirty_AOBJExtPal.DeriveState(&GPU.VRAMMap_AOBJExtPal, GPU);
+
+        // queued scanlines still read the old contents
+        if (bgDirty || bgExtPalDirty || objExtPalDirty)
+            WaitIdle();
+
+        GPU.MakeVRAMFlat_ABGCoherent(bgDirty);
+        GPU.MakeVRAMFlat_ABGExtPalCoherent(bgExtPalDirty);
+        GPU.MakeVRAMFlat_AOBJExtPalCoherent(objExtPalDirty);
     }
     else
     {
-        width = 256;
-        height = 64 * sz;
+        auto bgDirty = GPU.VRAMDirty_BBG.DeriveState(GPU.VRAMMap_BBG, GPU);
+        auto bgExtPalDirty = GPU.VRAMDirty_BBGExtPal.DeriveState(GPU.VRAMMap_BBGExtPal, GPU);
+        auto objExtPalDirty = GPU.VRAMDirty_BOBJExtPal.DeriveState(&GPU.VRAMMap_BOBJExtPal, GPU);
+
+        if (bgDirty || bgExtPalDirty || objExtPalDirty)
+            WaitIdle();
+
+        GPU.MakeVRAMFlat_BBGCoherent(bgDirty);
+        GPU.MakeVRAMFlat_BBGExtPalCoherent(bgExtPalDirty);
+        GPU.MakeVRAMFlat_BOBJExtPalCoherent(objExtPalDirty);
     }
+}
+
+void SoftRenderer::UpdateOBJVRAM(const melonDS::GPU2D& unit)
+{
+    // the OBJ buffers don't get updated at all if the 2D engine is disabled
+    if (!unit.Enabled)
+        return;
+
+    if (unit.Num == 0)
+    {
+        auto objDirty = GPU.VRAMDirty_AOBJ.DeriveState(GPU.VRAMMap_AOBJ, GPU);
+        if (objDirty)
+            WaitIdle();
+        GPU.MakeVRAMFlat_AOBJCoherent(objDirty);
+    }
+    else
+    {
+        auto objDirty = GPU.VRAMDirty_BOBJ.DeriveState(GPU.VRAMMap_BOBJ, GPU);
+        if (objDirty)
+            WaitIdle();
+        GPU.MakeVRAMFlat_BOBJCoherent(objDirty);
+    }
+}
+
+bool SoftRenderer::CaptureNeeded(u32 line, u32 captureCnt, u32 lcdcMap) const
+{
+    u32 height;
+    u32 sz = (captureCnt >> 20) & 0x3;
+    if (sz == 0)
+        height = 128;
+    else
+        height = 64 * sz;
 
     if (line >= height)
-        return;
+        return false;
 
     u32 dstvram = (captureCnt >> 16) & 0x3;
-    if (!(GPU.VRAMMap_LCDC & (1<<dstvram)))
-        return;
+    return (lcdcMap & (1<<dstvram)) != 0;
+}
 
+const u16* SoftRenderer::CaptureSourceB(u32 line, u32 captureCnt, u32 dispCnt) const
+{
+    if (captureCnt & (1<<25))
+        return GPU.DispFIFOBuffer;
+
+    u32 srcvram = (dispCnt >> 18) & 0x3;
+    if (!(GPU.VRAMMap_LCDC & (1<<srcvram)))
+        return nullptr;
+
+    u32 offset = line * 256;
+    if (((dispCnt >> 16) & 0x3) != 2)
+        offset += (((captureCnt >> 26) & 0x3) << 14);
+
+    return &((const u16*)GPU.VRAM[srcvram])[offset & 0xFFFF];
+}
+
+void SoftRenderer::WriteCapture(u32 line, u32 captureCnt, const u32* srcA, const u16* srcB)
+{
+    u32 width;
+    u32 sz = (captureCnt >> 20) & 0x3;
+    if (sz == 0)
+        width = 128;
+    else
+        width = 256;
+
+    u32 dstvram = (captureCnt >> 16) & 0x3;
     u16* dst = (u16*)GPU.VRAM[dstvram];
     u32 dstaddr = (((captureCnt >> 18) & 0x3) << 14) + (line * width);
     dst += (dstaddr & 0xFFFF);
-
-    u32* srcA;
-    if (captureCnt & (1<<24))
-        srcA = Output3D;
-    else
-        srcA = Output2D[0];
-
-    u16* srcB = nullptr;
-    if (captureCnt & (1<<25))
-        srcB = GPU.DispFIFOBuffer;
-    else
-    {
-        u32 dispcnt = GPU.GPU2D_A.DispCnt;
-        u32 srcvram = (dispcnt >> 18) & 0x3;
-        if (GPU.VRAMMap_LCDC & (1<<srcvram))
-        {
-            srcB = (u16*)GPU.VRAM[srcvram];
-
-            u32 offset = line * 256;
-            if (((dispcnt >> 16) & 0x3) != 2)
-                offset += (((captureCnt >> 26) & 0x3) << 14);
-
-            srcB += (offset & 0xFFFF);
-        }
-    }
 
     static_assert(VRAMDirtyGranularity == 512);
     GPU.VRAMDirty[dstvram][(dstaddr * 2) / VRAMDirtyGranularity] = true;
@@ -399,6 +640,280 @@ void SoftRenderer::DoCapture(u32 line)
             }
         }
         break;
+    }
+}
+
+
+void SoftRenderer::VBlank()
+{
+    // the capture ends here, the CPU may read the result from now on
+    for (u32 bank = 0; bank < 4; bank++)
+        SyncCaptures(bank);
+
+    CaptureImmediate = false;
+}
+
+void SoftRenderer::SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete)
+{
+    // the CPU accesses a captured block
+    SyncCaptures(bank);
+
+    if (Threaded2D && GPU.CaptureEnable)
+        CaptureImmediate = true;
+}
+
+void SoftRenderer::SwapBuffers()
+{
+    // finish the frame before it is shown
+    WaitIdle();
+
+    BackBuffer ^= 1;
+}
+
+
+void SoftRenderer::SetThreaded2D(bool threaded)
+{
+    if (threaded == Threaded2D)
+        return;
+
+    if (threaded)
+    {
+        if (!Jobs)
+        {
+            Jobs = std::make_unique<Job2D[]>(NumJobs);
+            PaletteCopies = std::make_unique<u8[]>(NumMemCopies * sizeof(GPU.Palette));
+            OAMCopies = std::make_unique<u8[]>(NumMemCopies * sizeof(GPU.OAM));
+        }
+
+        JobsSubmitted = 0;
+        JobsDone = 0;
+        JobsRetired = 0;
+        memset(CaptureJobs, 0, sizeof(CaptureJobs));
+        CaptureImmediate = false;
+        memset(PaletteCopyJobs, 0, sizeof(PaletteCopyJobs));
+        memset(OAMCopyJobs, 0, sizeof(OAMCopyJobs));
+        CurPaletteCopy = 0;
+        CurOAMCopy = 0;
+
+        // the first job takes fresh copies
+        GPU.PaletteWritten = true;
+        GPU.OAMWritten = true;
+
+        StopThread2D = false;
+        WorkerSleeping = false;
+        EmuWaiting = false;
+        Platform::Semaphore_Reset(Sema_Work);
+        Platform::Semaphore_Reset(Sema_Done);
+
+        Thread2D = Platform::Thread_Create([this]() { RenderThread2DFunc(); });
+        if (!Thread2D)
+            return; // no thread support, stay unthreaded
+
+        Threaded2D = true;
+    }
+    else
+    {
+        WaitIdle();
+
+        StopThread2D = true;
+        Platform::Semaphore_Post(Sema_Work);
+        Platform::Thread_Wait(Thread2D);
+        Platform::Thread_Free(Thread2D);
+        Thread2D = nullptr;
+
+        Threaded2D = false;
+
+        Soft2D_A->SetMemory(GPU.Palette, GPU.OAM);
+        Soft2D_B->SetMemory(GPU.Palette, GPU.OAM);
+    }
+}
+
+void SoftRenderer::RenderThread2DFunc()
+{
+    u32 done = JobsDone.load(std::memory_order_relaxed);
+
+    for (;;)
+    {
+        if (JobsSubmitted.load(std::memory_order_acquire) == done)
+        {
+            auto ready = [&]() {
+                return JobsSubmitted.load(std::memory_order_acquire) != done
+                    || StopThread2D.load(std::memory_order_relaxed);
+            };
+
+            if (!SpinUntil(ready, RenderThreadSpin))
+            {
+                // the emulation thread posts Sema_Work if it sees this flag after submitting a job
+                WorkerSleeping = true;
+                if (JobsSubmitted.load() == done && !StopThread2D)
+                    Platform::Semaphore_Wait(Sema_Work);
+                WorkerSleeping = false;
+            }
+
+            if (StopThread2D)
+                return;
+
+            continue;
+        }
+
+        RunJob(Jobs[done % NumJobs]);
+
+        done++;
+        JobsDone.store(done);
+
+        if (EmuWaiting.load() && EmuWaiting.exchange(false))
+            Platform::Semaphore_Post(Sema_Done);
+    }
+}
+
+void SoftRenderer::RunJob(Job2D& job)
+{
+    if (!job.Sprites && job.VCount >= 192)
+    {
+        // no 2D state needed for these
+        RenderScanline(job.VCount, job.DstA, job.DstB, job.ScreensEnabled, nullptr, 0, 0);
+        return;
+    }
+
+    static_cast<GPU2DState&>(State2D_A) = job.State[0];
+    static_cast<GPU2DState&>(State2D_B) = job.State[1];
+
+    u8* palette = &PaletteCopies[job.PaletteCopy * sizeof(GPU.Palette)];
+    u8* oam = &OAMCopies[job.OAMCopy * sizeof(GPU.OAM)];
+    Soft2D_A->SetMemory(palette, oam);
+    Soft2D_B->SetMemory(palette, oam);
+
+    if (job.Sprites)
+    {
+        Rend2D_A->DrawSprites(job.Line);
+        Rend2D_B->DrawSprites(job.Line);
+        return;
+    }
+
+    Output3D = job.Line3D;
+    RenderScanline(job.VCount, job.DstA, job.DstB, job.ScreensEnabled,
+                   job.HasDisplayLine ? job.DisplayLine : nullptr,
+                   job.BrightnessA, job.BrightnessB);
+
+    if (job.Capture)
+    {
+        const u32* srcA = (job.CaptureCnt & (1<<24)) ? Output3D : Output2D[0];
+        memcpy(job.CaptureA, srcA, sizeof(job.CaptureA));
+    }
+}
+
+SoftRenderer::Job2D& SoftRenderer::BeginJob()
+{
+    u32 seq = JobsSubmitted.load(std::memory_order_relaxed);
+
+    // the slot must be done and retired
+    WaitForJobs(seq - NumJobs + 1);
+    RetireJobs();
+
+    return Jobs[seq % NumJobs];
+}
+
+void SoftRenderer::BeginJobState(Job2D& job)
+{
+    u32 seq = JobsSubmitted.load(std::memory_order_relaxed);
+
+    // captures are written with the VRAM mapping of their scanline
+    // if that changed, write them before anything gets to see the new mapping
+    if (GPU.VRAMMap_LCDC != CaptureLCDCMap)
+    {
+        for (u32 bank = 0; bank < 4; bank++)
+            SyncCaptures(bank);
+        CaptureLCDCMap = GPU.VRAMMap_LCDC;
+    }
+
+    job.State[0] = GPU.GPU2D_A;
+    job.State[1] = GPU.GPU2D_B;
+
+    if (GPU.PaletteWritten)
+    {
+        u32 next = (CurPaletteCopy + 1) % NumMemCopies;
+        WaitForJobs(PaletteCopyJobs[next]);
+        memcpy(&PaletteCopies[next * sizeof(GPU.Palette)], GPU.Palette, sizeof(GPU.Palette));
+        CurPaletteCopy = next;
+        GPU.PaletteWritten = false;
+    }
+    PaletteCopyJobs[CurPaletteCopy] = seq + 1;
+    job.PaletteCopy = CurPaletteCopy;
+
+    if (GPU.OAMWritten)
+    {
+        u32 next = (CurOAMCopy + 1) % NumMemCopies;
+        WaitForJobs(OAMCopyJobs[next]);
+        memcpy(&OAMCopies[next * sizeof(GPU.OAM)], GPU.OAM, sizeof(GPU.OAM));
+        CurOAMCopy = next;
+        GPU.OAMWritten = false;
+    }
+    OAMCopyJobs[CurOAMCopy] = seq + 1;
+    job.OAMCopy = CurOAMCopy;
+}
+
+void SoftRenderer::SubmitJob()
+{
+    JobsSubmitted.store(JobsSubmitted.load(std::memory_order_relaxed) + 1);
+
+    if (WorkerSleeping.load() && WorkerSleeping.exchange(false))
+        Platform::Semaphore_Post(Sema_Work);
+}
+
+void SoftRenderer::WaitForJobs(u32 count)
+{
+    auto reached = [&]() { return (s32)(JobsDone.load() - count) >= 0; };
+
+    if (reached() || SpinUntil(reached, EmuThreadSpin))
+        return;
+
+    for (;;)
+    {
+        // the render thread posts Sema_Done if it sees this flag after finishing a job
+        EmuWaiting = true;
+        if (reached())
+        {
+            EmuWaiting = false;
+            return;
+        }
+
+        Platform::Semaphore_Wait(Sema_Done);
+        if (reached())
+            return;
+    }
+}
+
+void SoftRenderer::RetireJobs()
+{
+    u32 done = JobsDone.load(std::memory_order_acquire);
+    while (JobsRetired != done)
+    {
+        Job2D& job = Jobs[JobsRetired % NumJobs];
+        if (job.Capture)
+            WriteCapture(job.VCount, job.CaptureCnt, job.CaptureA, job.HasCaptureB ? job.CaptureB : nullptr);
+
+        JobsRetired++;
+    }
+}
+
+void SoftRenderer::WaitIdle()
+{
+    if (!Threaded2D)
+        return;
+
+    WaitForJobs(JobsSubmitted.load(std::memory_order_relaxed));
+    RetireJobs();
+}
+
+void SoftRenderer::SyncCaptures(u32 bank)
+{
+    if (!Threaded2D)
+        return;
+
+    if ((s32)(CaptureJobs[bank] - JobsRetired) > 0)
+    {
+        WaitForJobs(CaptureJobs[bank]);
+        RetireJobs();
     }
 }
 

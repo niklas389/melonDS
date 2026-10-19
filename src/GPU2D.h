@@ -26,44 +26,10 @@ namespace melonDS
 {
 class GPU;
 
-class GPU2D
+// The registers and internal state of a 2D engine, as read by the 2D renderers.
+// Kept separate so that a renderer can work from a copy while the emulation moves on.
+struct GPU2DState
 {
-public:
-    // take a reference to the GPU so we can access its state
-    // and ensure that it's not null
-    GPU2D(u32 num, melonDS::GPU& gpu);
-    virtual ~GPU2D() = default;
-    GPU2D(const GPU2D&) = delete;
-    GPU2D& operator=(const GPU2D&) = delete;
-
-    void Reset();
-
-    void DoSavestate(Savestate* file);
-
-    void SetEnabled(bool enable) { Enabled = enable; }
-
-    u8 Read8(u32 addr);
-    u16 Read16(u32 addr);
-    u32 Read32(u32 addr);
-    void Write8(u32 addr, u8 val);
-    void Write16(u32 addr, u16 val);
-    void Write32(u32 addr, u32 val);
-
-    void UpdateRegistersPreDraw(bool reset);
-    void UpdateRegistersPostDraw(bool reset);
-    void UpdateWindows(u32 line);
-
-    u16* GetBGExtPal(u32 slot, u32 pal);
-    u16* GetOBJExtPal();
-
-    void GetBGVRAM(u8*& data, u32& mask) const;
-    void GetOBJVRAM(u8*& data, u32& mask) const;
-
-    void GetCaptureInfo_BG(int* info) const;
-    void GetCaptureInfo_OBJ(int* info) const;
-
-    void CalculateWindowMask(u8* windowMask, const u8* objWindow);
-
     u32 Num;
     bool Enabled;
 
@@ -107,6 +73,45 @@ public:
     u16 BlendAlpha;
     u8 EVA, EVB;
     u8 EVY;
+};
+
+class GPU2D : public GPU2DState
+{
+public:
+    // take a reference to the GPU so we can access its state
+    // and ensure that it's not null
+    GPU2D(u32 num, melonDS::GPU& gpu);
+    virtual ~GPU2D() = default;
+    GPU2D(const GPU2D&) = delete;
+    GPU2D& operator=(const GPU2D&) = delete;
+
+    void Reset();
+
+    void DoSavestate(Savestate* file);
+
+    void SetEnabled(bool enable) { Enabled = enable; }
+
+    u8 Read8(u32 addr);
+    u16 Read16(u32 addr);
+    u32 Read32(u32 addr);
+    void Write8(u32 addr, u8 val);
+    void Write16(u32 addr, u16 val);
+    void Write32(u32 addr, u32 val);
+
+    void UpdateRegistersPreDraw(bool reset);
+    void UpdateRegistersPostDraw(bool reset);
+    void UpdateWindows(u32 line);
+
+    u16* GetBGExtPal(u32 slot, u32 pal);
+    u16* GetOBJExtPal();
+
+    void GetBGVRAM(u8*& data, u32& mask) const;
+    void GetOBJVRAM(u8*& data, u32& mask) const;
+
+    void GetCaptureInfo_BG(int* info) const;
+    void GetCaptureInfo_OBJ(int* info) const;
+
+    void CalculateWindowMask(u8* windowMask, const u8* objWindow);
 
 private:
     friend class Renderer2D;

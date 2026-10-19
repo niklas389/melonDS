@@ -551,6 +551,7 @@ public:
         addr &= 0x7FF;
 
         *(T*)&Palette[addr] = val;
+        PaletteWritten = true;
         if (addr & 0x3FE)
             PaletteDirty |= 1 << (addr / VRAMDirtyGranularity);
         else
@@ -569,6 +570,7 @@ public:
         addr &= 0x7FF;
 
         *(T*)&OAM[addr] = val;
+        OAMWritten = true;
         OAMDirty |= 1 << (addr / 1024);
     }
 
@@ -704,6 +706,11 @@ public:
     u32 OAMDirty = 0;
     u32 PaletteDirty = 0;
 
+    // set whenever palette or OAM memory changes
+    // the threaded software 2D renderer clears them when it takes a copy
+    bool OAMWritten = true;
+    bool PaletteWritten = true;
+
 private:
     void ResetVRAMCache() noexcept;
 
@@ -828,6 +835,9 @@ struct RendererSettings
 
     // "improved polygon splitting" (regular OpenGL renderer)
     bool BetterPolygons;
+
+    // whether the software renderer draws the 2D engines on a separate thread
+    bool Threaded2D = false;
 };
 
 class Renderer

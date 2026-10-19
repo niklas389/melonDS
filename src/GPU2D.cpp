@@ -87,8 +87,9 @@ using Platform::LogLevel;
 // to model the hardware more accurately, the relevant logic should be moved to GPU.cpp.
 
 
-GPU2D::GPU2D(u32 num, melonDS::GPU& gpu) : Num(num), GPU(gpu)
+GPU2D::GPU2D(u32 num, melonDS::GPU& gpu) : GPU(gpu)
 {
+    Num = num;
 }
 
 void GPU2D::Reset()

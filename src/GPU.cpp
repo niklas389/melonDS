@@ -195,6 +195,8 @@ void GPU::Reset() noexcept
 
     OAMDirty = 0x3;
     PaletteDirty = 0x5F;
+    OAMWritten = true;
+    PaletteWritten = true;
 }
 
 void GPU::Stop() noexcept
@@ -306,6 +308,8 @@ void GPU::DoSavestate(Savestate* file) noexcept
         ResetVRAMCache();
         OAMDirty = 0x3;
         PaletteDirty = 0x5F;
+        OAMWritten = true;
+        PaletteWritten = true;
     }
 
     Rend->PostSavestate();
@@ -341,6 +345,8 @@ void GPU::SetRenderer(std::unique_ptr<Renderer>&& renderer) noexcept
     ResetVRAMCache();
     OAMDirty = 0x3;
     PaletteDirty = 0x5F;
+    OAMWritten = true;
+    PaletteWritten = true;
 }
 
 

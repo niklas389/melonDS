@@ -1756,6 +1756,9 @@ void SoftRenderer3D::RenderPolygons(bool threaded, Polygon** polygons, int npoly
 
     for (s32 y = 1; y < 192; y++)
     {
+        if (threaded && CancelFrame.load(std::memory_order_relaxed))
+            break;
+
         RenderScanline(ctx, y, j);
         ScanlineFinalPass(y-1);
 
@@ -1845,6 +1848,9 @@ void SoftRenderer3D::RenderPolygonsSplit(Polygon** polygons, int npolys)
     RenderScanline(TopContext, 0, j);
     for (s32 y = 1; y < SplitLine; y++)
     {
+        if (CancelFrame.load(std::memory_order_relaxed))
+            break;
+
         RenderScanline(TopContext, y, j);
         ScanlineFinalPass(y-1);
 
@@ -1997,6 +2003,9 @@ void SoftRenderer3D::RenderBottomHalf()
     RenderScanline(SplitContext, SplitLine, j);
     for (s32 y = SplitLine + 1; y < 192; y++)
     {
+        if (CancelFrame.load(std::memory_order_relaxed))
+            break;
+
         RenderScanline(SplitContext, y, j);
 
         if (y - 1 > SplitLine)
@@ -2045,10 +2054,51 @@ void SoftRenderer3D::FinishRendering()
         Platform::Semaphore_Wait(Sema_RenderDone);
 }
 
+bool SoftRenderer3D::RenderFrameEarly()
+{
+    EarlyFrame = false;
+    if (!RenderThreadRunning.load(std::memory_order_relaxed) || GPU3D.AbortFrame)
+        return false;
+
+    // the render threads are idle (see FinishRendering), so the shadow state can be saved
+    memcpy(EarlyStencilBuffer, StencilBuffer, sizeof(StencilBuffer));
+    EarlyPrevIsShadowMask = PrevIsShadowMask;
+
+    RenderFrame();
+    EarlyFrame = true;
+    return true;
+}
+
 void SoftRenderer3D::RenderFrame()
 {
     auto textureDirty = GPU.VRAMDirty_Texture.DeriveState(GPU.VRAMMap_Texture, GPU);
     auto texPalDirty = GPU.VRAMDirty_TexPal.DeriveState(GPU.VRAMMap_TexPal, GPU);
+
+    if (EarlyFrame)
+    {
+        EarlyFrame = false;
+
+        // nothing the frame depends on changed since it was started
+        if (!textureDirty && !texPalDirty)
+            return;
+
+        // stop the frame and start it over with the new texture memory
+        CancelFrame = true;
+        Platform::Semaphore_Wait(Sema_RenderDone);
+        CancelFrame = false;
+        Platform::Semaphore_Reset(Sema_ScanlineCount);
+
+        memcpy(StencilBuffer, EarlyStencilBuffer, sizeof(StencilBuffer));
+        PrevIsShadowMask = EarlyPrevIsShadowMask;
+
+        GPU.MakeVRAMFlat_TextureCoherent(textureDirty);
+        GPU.MakeVRAMFlat_TexPalCoherent(texPalDirty);
+
+        // the buffers hold part of the cancelled frame now
+        FrameIdentical = false;
+        Platform::Semaphore_Post(Sema_RenderStart);
+        return;
+    }
 
     bool textureChanged = GPU.MakeVRAMFlat_TextureCoherent(textureDirty);
     bool texPalChanged = GPU.MakeVRAMFlat_TexPalCoherent(texPalDirty);
@@ -2069,6 +2119,7 @@ void SoftRenderer3D::RenderFrame()
 
 void SoftRenderer3D::RestartFrame()
 {
+    EarlyFrame = false;
     SetupRenderThread();
     EnableRenderThread();
 }

@@ -63,6 +63,11 @@ private:
     friend class SoftRenderer2D;
     friend class SoftRenderer3D;
 
+    // lets the queued scanlines read a copy of the 3D buffer before a new frame is drawn into it
+    void StartFrame3D();
+    // whether VBlank() started the next 3D frame
+    bool Early3DFrame = false;
+
     // The 2D renderers read these copies of the 2D engines' state.
     // Unthreaded, they are refreshed right before drawing;
     // threaded, the render thread loads them from each job.

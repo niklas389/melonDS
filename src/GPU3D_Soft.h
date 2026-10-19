@@ -46,6 +46,12 @@ public:
     void FinishRendering() override;
     void RestartFrame() override;
 
+    // with the render thread, start rendering the next frame when VBlank starts, rather than
+    // when RenderFrame() is called; by then, only the texture memory may still change, and if it
+    // did, RenderFrame() renders the frame again
+    // returns whether it started the frame
+    bool RenderFrameEarly();
+
     u32* GetLine(int line) override;
 
     // whether a line returned by GetLine stays valid until the next frame starts rendering
@@ -707,6 +713,13 @@ private:
 
     u8 StencilBuffer[256*2];
     bool PrevIsShadowMask;
+
+    // a frame started by RenderFrameEarly(), with the shadow state it started from
+    bool EarlyFrame = false;
+    u8 EarlyStencilBuffer[256*2];
+    bool EarlyPrevIsShadowMask;
+    // tells the render threads to stop drawing the frame, which will be drawn again
+    std::atomic_bool CancelFrame {false};
 
     bool Enabled;
 

@@ -1450,16 +1450,15 @@ void SoftRenderer3D::RenderScanline(RasterContext& ctx, s32 y, int npolys)
 {
     for (int i = 0; i < npolys; i++)
     {
-        RendererPolygon* rp = &ctx.Polygons[i];
-        Polygon* polygon = rp->PolyData;
+        const LineRange& lines = ctx.Ranges[i];
+        if (y < lines.Top || y >= lines.Bottom)
+            continue;
 
-        if (y >= polygon->YTop && (y < polygon->YBottom || (y == polygon->YTop && polygon->YBottom == polygon->YTop)))
-        {
-            if (polygon->IsShadowMask)
-                RenderShadowMaskScanline(ctx, rp, y);
-            else
-                RenderPolygonScanline(ctx, rp, y);
-        }
+        RendererPolygon* rp = &ctx.Polygons[i];
+        if (rp->PolyData->IsShadowMask)
+            RenderShadowMaskScanline(ctx, rp, y);
+        else
+            RenderPolygonScanline(ctx, rp, y);
     }
 }
 
@@ -1773,10 +1772,11 @@ void SoftRenderer3D::RenderPolygons(bool threaded, Polygon** polygons, int npoly
     for (int i = 0; i < npolys; i++)
     {
         if (polygons[i]->Degenerate) continue;
+        PolygonRanges[j] = PolygonLines(polygons[i]);
         SetupPolygon(&PolygonList[j++], polygons[i]);
     }
 
-    RasterContext ctx {PolygonList, StencilBuffer, PrevIsShadowMask};
+    RasterContext ctx {PolygonList, PolygonRanges, StencilBuffer, PrevIsShadowMask};
 
     RenderScanline(ctx, 0, j);
 
@@ -1862,10 +1862,11 @@ void SoftRenderer3D::RenderPolygonsSplit(Polygon** polygons, int npolys)
     for (int i = 0; i < npolys; i++)
     {
         if (polygons[i]->Degenerate) continue;
+        PolygonRanges[j] = PolygonLines(polygons[i]);
         SetupPolygon(&PolygonList[j++], polygons[i]);
     }
 
-    TopContext = {PolygonList, StencilBuffer, PrevIsShadowMask};
+    TopContext = {PolygonList, PolygonRanges, StencilBuffer, PrevIsShadowMask};
 
     RenderScanline(TopContext, 0, j);
     for (s32 y = 1; y < SplitLine; y++)
@@ -1986,6 +1987,7 @@ void SoftRenderer3D::RenderBottomHalf()
         Polygon* polygon = SplitPolygons[i];
         if (polygon->Degenerate) continue;
 
+        SplitPolygonRanges[j] = PolygonLines(polygon);
         RendererPolygon* rp = &SplitPolygonList[j++];
         SetupPolygon(rp, polygon);
 
@@ -2005,7 +2007,7 @@ void SoftRenderer3D::RenderBottomHalf()
         prevIsShadowMask = TopContext.PrevIsShadowMask;
     }
 
-    SplitContext = {SplitPolygonList, SplitStencilBuffer, prevIsShadowMask};
+    SplitContext = {SplitPolygonList, SplitPolygonRanges, SplitStencilBuffer, prevIsShadowMask};
 
     bool boundaryDone = false;
     auto finishBoundary = [&]() {

@@ -463,9 +463,24 @@ private:
 
     // the per-thread rasterizer state: polygon edges, and the stencil buffer for shadows,
     // which carries over between scanlines of the same parity
+    // the scanlines a polygon is drawn on, top <= y < bottom; kept apart from the polygons
+    // so that finding the ones on a scanline doesn't need to touch them
+    struct LineRange
+    {
+        s32 Top, Bottom;
+    };
+    static LineRange PolygonLines(const Polygon* polygon) noexcept
+    {
+        // a polygon whose top and bottom are the same is drawn on that one scanline
+        s32 bottom = (polygon->YBottom == polygon->YTop) ? polygon->YTop + 1 : polygon->YBottom;
+        return {polygon->YTop, bottom};
+    }
+    LineRange PolygonRanges[2048];
+
     struct RasterContext
     {
         RendererPolygon* Polygons;
+        const LineRange* Ranges;
         u8* StencilBuffer;
         bool PrevIsShadowMask;
     };
@@ -569,6 +584,7 @@ private:
     int SplitNumPolygons = 0;
     bool SplitStartPrevIsShadowMask = false;
     RendererPolygon SplitPolygonList[2048];
+    LineRange SplitPolygonRanges[2048];
     u8 SplitStencilBuffer[256*2];
     RasterContext SplitContext;
     RasterContext TopContext;

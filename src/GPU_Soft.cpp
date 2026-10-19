@@ -76,11 +76,13 @@ constexpr std::chrono::microseconds EmuThreadSpin(100);
 SoftRenderer::SoftRenderer(melonDS::NDS& nds)
     : Renderer(nds.GPU), State2D_A(0, nds.GPU), State2D_B(1, nds.GPU)
 {
+    // the top and bottom screens of each buffer are contiguous, so that a frontend
+    // can show them stacked without copying
     const size_t len = 256 * 192;
-    Framebuffer[0][0] = new u32[len];
-    Framebuffer[0][1] = new u32[len];
-    Framebuffer[1][0] = new u32[len];
-    Framebuffer[1][1] = new u32[len];
+    Framebuffer[0][0] = new u32[len * 2];
+    Framebuffer[0][1] = Framebuffer[0][0] + len;
+    Framebuffer[1][0] = new u32[len * 2];
+    Framebuffer[1][1] = Framebuffer[1][0] + len;
     BackBuffer = 0;
 
     auto rend2D_A = std::make_unique<SoftRenderer2D>(State2D_A, *this);
@@ -105,9 +107,7 @@ SoftRenderer::~SoftRenderer()
     Platform::Semaphore_Free(Sema_Done);
 
     delete[] Framebuffer[0][0];
-    delete[] Framebuffer[0][1];
     delete[] Framebuffer[1][0];
-    delete[] Framebuffer[1][1];
 }
 
 void SoftRenderer::Reset()

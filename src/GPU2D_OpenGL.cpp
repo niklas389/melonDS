@@ -148,8 +148,10 @@ bool GLRenderer2D::InitShaders()
 
     uniloc = glGetUniformBlockIndex(CompositorShader, "ubBGConfig");
     glUniformBlockBinding(CompositorShader, uniloc, 20);
-    uniloc = glGetUniformBlockIndex(CompositorShader, "ubScanlineConfig");
+    uniloc = glGetUniformBlockIndex(CompositorShader, "ubScanlineConfigLo");
     glUniformBlockBinding(CompositorShader, uniloc, 22);
+    uniloc = glGetUniformBlockIndex(CompositorShader, "ubScanlineConfigHi");
+    glUniformBlockBinding(CompositorShader, uniloc, 25);
     uniloc = glGetUniformBlockIndex(CompositorShader, "ubCompositorConfig");
     glUniformBlockBinding(CompositorShader, uniloc, 23);
 
@@ -1791,7 +1793,11 @@ void GLRenderer2D::RenderScreen(int ystart, int yend)
     glUseProgram(CompositorShader);
 
     glBindBufferBase(GL_UNIFORM_BUFFER, 20, LayerConfigUBO);
-    glBindBufferBase(GL_UNIFORM_BUFFER, 22, ScanlineConfigUBO);
+    // The scanline config is bound as two halves; see ubScanlineConfigLo/Hi in 2DCompositorFS
+    constexpr GLsizeiptr scanlineHalf = (192 / 2) * sizeof(sScanlineConfig::sScanline);
+    static_assert((scanlineHalf % 256) == 0, "each half must start at a valid uniform buffer offset");
+    glBindBufferRange(GL_UNIFORM_BUFFER, 22, ScanlineConfigUBO, 0, scanlineHalf);
+    glBindBufferRange(GL_UNIFORM_BUFFER, 25, ScanlineConfigUBO, scanlineHalf, scanlineHalf);
     glBindBufferBase(GL_UNIFORM_BUFFER, 23, CompositorConfigUBO);
 
     glBindBuffer(GL_UNIFORM_BUFFER, ScanlineConfigUBO);

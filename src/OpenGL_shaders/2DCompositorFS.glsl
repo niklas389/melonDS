@@ -34,10 +34,21 @@ struct sScanline
     ivec4 MosaicSize;
 };
 
-layout(std140) uniform ubScanlineConfig
+// Split in two so each block stays within the 16 KB that OpenGL ES guarantees
+layout(std140) uniform ubScanlineConfigLo
 {
-    sScanline uScanline[192];
+    sScanline uScanlineLo[96];
 };
+
+layout(std140) uniform ubScanlineConfigHi
+{
+    sScanline uScanlineHi[96];
+};
+
+sScanline Scanline(int line)
+{
+    return (line < 96) ? uScanlineLo[line] : uScanlineHi[line - 96];
+}
 
 layout(std140) uniform ubCompositorConfig
 {
@@ -88,10 +99,10 @@ vec4 BG3Fetch(vec2 coord)
 
 vec4 BG0CalcAndFetch(vec2 coord, int line)
 {
-    ivec2 bgoffset = uScanline[line].BGOffset[0];
+    ivec2 bgoffset = Scanline(line).BGOffset[0];
     vec2 bgpos = vec2(bgoffset.xy) + coord;
 
-    if (uScanline[line].BGMosaicEnable[0])
+    if (Scanline(line).BGMosaicEnable[0])
     {
         bgpos = floor(bgpos) - vec2(MosaicX, 0);
     }
@@ -101,10 +112,10 @@ vec4 BG0CalcAndFetch(vec2 coord, int line)
 
 vec4 BG1CalcAndFetch(vec2 coord, int line)
 {
-    ivec2 bgoffset = uScanline[line].BGOffset[1];
+    ivec2 bgoffset = Scanline(line).BGOffset[1];
     vec2 bgpos = vec2(bgoffset.xy) + coord;
 
-    if (uScanline[line].BGMosaicEnable[1])
+    if (Scanline(line).BGMosaicEnable[1])
     {
         bgpos = floor(bgpos) - vec2(MosaicX, 0);
     }
@@ -114,13 +125,13 @@ vec4 BG1CalcAndFetch(vec2 coord, int line)
 
 vec4 BG2CalcAndFetch(vec2 coord, int line)
 {
-    ivec2 bgoffset = uScanline[line].BGOffset[2];
+    ivec2 bgoffset = Scanline(line).BGOffset[2];
     vec2 bgpos;
     if (uBGConfig[2].Type >= 2)
     {
         // rotscale BG
         bgpos = vec2(bgoffset.xy) / 256.0;
-        vec4 rotscale = vec4(uScanline[line].BGRotscale[0]) / 256.0;
+        vec4 rotscale = vec4(Scanline(line).BGRotscale[0]) / 256.0;
         mat2 rsmatrix = mat2(rotscale.xy, rotscale.zw);
         bgpos = bgpos + (coord * rsmatrix);
     }
@@ -130,7 +141,7 @@ vec4 BG2CalcAndFetch(vec2 coord, int line)
         bgpos = vec2(bgoffset.xy) + coord;
     }
 
-    if (uScanline[line].BGMosaicEnable[2])
+    if (Scanline(line).BGMosaicEnable[2])
     {
         bgpos = floor(bgpos) - vec2(MosaicX, 0);
     }
@@ -160,13 +171,13 @@ vec4 BG2CalcAndFetch(vec2 coord, int line)
 
 vec4 BG3CalcAndFetch(vec2 coord, int line)
 {
-    ivec2 bgoffset = uScanline[line].BGOffset[3];
+    ivec2 bgoffset = Scanline(line).BGOffset[3];
     vec2 bgpos;
     if (uBGConfig[3].Type >= 2)
     {
         // rotscale BG
         bgpos = vec2(bgoffset.xy) / 256.0;
-        vec4 rotscale = vec4(uScanline[line].BGRotscale[1]) / 256.0;
+        vec4 rotscale = vec4(Scanline(line).BGRotscale[1]) / 256.0;
         mat2 rsmatrix = mat2(rotscale.xy, rotscale.zw);
         bgpos = bgpos + (coord * rsmatrix);
     }
@@ -176,7 +187,7 @@ vec4 BG3CalcAndFetch(vec2 coord, int line)
         bgpos = vec2(bgoffset.xy) + coord;
     }
 
-    if (uScanline[line].BGMosaicEnable[3])
+    if (Scanline(line).BGMosaicEnable[3])
     {
         bgpos = floor(bgpos) - vec2(MosaicX, 0);
     }
@@ -217,7 +228,7 @@ void CalcSpriteMosaic(in ivec2 coord, out ivec4 objflags, out vec4 objcolor)
         }
         else
         {
-            int mosx = texelFetch(MosaicTex, ivec2(curpos.x, uScanline[curpos.y].MosaicSize.z), 0).r;
+            int mosx = texelFetch(MosaicTex, ivec2(curpos.x, Scanline(curpos.y).MosaicSize.z), 0).r;
             vec4 color = texelFetch(OBJLayerTex, ivec3(curpos * uScaleFactor, 0), 0);
             ivec4 flags = ivec4(texelFetch(OBJLayerTex, ivec3(curpos * uScaleFactor, 1), 0) * 255.0);
 
@@ -247,10 +258,10 @@ vec4 CompositeLayers()
     int xpos = int(fTexcoord.x);
     int line = int(fTexcoord.y);
 
-    if (uScanline[line].MosaicSize.x > 0)
-        MosaicX = texelFetch(MosaicTex, ivec2(bgcoord.x, uScanline[line].MosaicSize.x), 0).r;
+    if (Scanline(line).MosaicSize.x > 0)
+        MosaicX = texelFetch(MosaicTex, ivec2(bgcoord.x, Scanline(line).MosaicSize.x), 0).r;
 
-    ivec4 col1 = ivec4(ConvertColor(uScanline[line].BackColor), 0x20);
+    ivec4 col1 = ivec4(ConvertColor(Scanline(line).BackColor), 0x20);
     int mask1 = 0x20;
     ivec4 col2 = ivec4(0);
     int mask2 = 0;
@@ -263,7 +274,7 @@ vec4 CompositeLayers()
     layercol[3] = BG3CalcAndFetch(bgcoord, line);
 
     ivec4 objflags;
-    if (uScanline[line].MosaicSize.z > 0)
+    if (Scanline(line).MosaicSize.z > 0)
     {
         CalcSpriteMosaic(ivec2(fTexcoord.xy), objflags, layercol[4]);
     }
@@ -274,24 +285,24 @@ vec4 CompositeLayers()
         objflags = ivec4(layercol[5] * 255.0);
     }
 
-    int winmask = uScanline[line].WinMask;
+    int winmask = Scanline(line).WinMask;
     bool inside_win0, inside_win1;
 
-    if (xpos < uScanline[line].WinPos[0])
+    if (xpos < Scanline(line).WinPos[0])
         inside_win0 = ((winmask & (1<<0)) != 0);
-    else if (xpos < uScanline[line].WinPos[1])
+    else if (xpos < Scanline(line).WinPos[1])
         inside_win0 = ((winmask & (1<<1)) != 0);
     else
         inside_win0 = ((winmask & (1<<2)) != 0);
 
-    if (xpos < uScanline[line].WinPos[2])
+    if (xpos < Scanline(line).WinPos[2])
         inside_win1 = ((winmask & (1<<3)) != 0);
-    else if (xpos < uScanline[line].WinPos[3])
+    else if (xpos < Scanline(line).WinPos[3])
         inside_win1 = ((winmask & (1<<4)) != 0);
     else
         inside_win1 = ((winmask & (1<<5)) != 0);
 
-    uint winregs = uScanline[line].WinRegs;
+    uint winregs = Scanline(line).WinRegs;
     uint winsel = winregs;
     if (objflags.b > 0)
         winsel = winregs >> 8;

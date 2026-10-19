@@ -100,10 +100,16 @@ if (ENABLE_OGLRENDERER)
         GPU_OpenGL.cpp
         GPU2D_OpenGL.cpp
         GPU3D_OpenGL.cpp
-        GPU3D_Compute.cpp
         GPU3D_TexcacheOpenGL.cpp
         GPU3D_TexcacheOpenGL.h
         OpenGLSupport.cpp)
+
+    if (ENABLE_GLES)
+        # The compute renderer needs desktop OpenGL 4.3
+        target_compile_definitions(core PUBLIC OGLRENDERER_GLES)
+    else()
+        target_sources(core PRIVATE GPU3D_Compute.cpp)
+    endif()
 
     target_compile_definitions(core PUBLIC OGLRENDERER_ENABLED)
 endif()

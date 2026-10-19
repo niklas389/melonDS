@@ -23,7 +23,9 @@
 #include "GPU.h"
 #include "GPU2D_OpenGL.h"
 #include "GPU3D_OpenGL.h"
+#ifndef OGLRENDERER_GLES
 #include "GPU3D_Compute.h"
+#endif
 
 namespace melonDS
 {

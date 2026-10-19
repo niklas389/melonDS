@@ -43,10 +43,15 @@ GLRenderer::GLRenderer(melonDS::NDS& nds, bool compute)
     Rend2D_B = std::make_unique<GLRenderer2D>(GPU.GPU2D_B, *this);
 
     // TODO, eventually: figure out a nicer way to support different 3D renderers?
+#ifdef OGLRENDERER_GLES
+    // OpenGL ES has no compute renderer
+    IsCompute = false;
+#else
     IsCompute = compute;
     if (IsCompute)
         Rend3D = std::make_unique<ComputeRenderer3D>(GPU.GPU3D, *this);
     else
+#endif
         Rend3D = std::make_unique<GLRenderer3D>(GPU.GPU3D, *this);
 
     ScaleFactor = 0;
@@ -146,7 +151,7 @@ bool GLRenderer::Init()
     glGenTextures(1, &AuxInputTex);
     glBindTexture(GL_TEXTURE_2D_ARRAY, AuxInputTex);
     glTexParams(GL_TEXTURE_2D_ARRAY, GL_REPEAT);
-    glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGB5_A1, 256, 256, 2, 0, GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, nullptr);
+    glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGB5_A1, 256, 256, 2, 0, GL_RGBA, OpenGL::PixelType1555, nullptr);
 
     glGenTextures(1, &CaptureVRAMTex);
     glBindTexture(GL_TEXTURE_2D_ARRAY, CaptureVRAMTex);
@@ -173,7 +178,7 @@ bool GLRenderer::Init()
     glGenTextures(1, &CaptureSyncTex);
     glBindTexture(GL_TEXTURE_2D, CaptureSyncTex);
     glTexParams(GL_TEXTURE_2D, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB5_A1, 256, 256, 0, GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, nullptr);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB5_A1, 256, 256, 0, GL_RGBA, OpenGL::PixelType1555, nullptr);
 
     glGenFramebuffers(1, &CaptureSyncFB);
     glBindFramebuffer(GL_FRAMEBUFFER, CaptureSyncFB);
@@ -329,12 +334,14 @@ void GLRenderer::SetRenderSettings(RendererSettings& settings)
     rend2d = dynamic_cast<GLRenderer2D*>(Rend2D_B.get());
     rend2d->SetScaleFactor(settings.ScaleFactor);
 
+#ifndef OGLRENDERER_GLES
     if (IsCompute)
     {
         auto rend3d = dynamic_cast<ComputeRenderer3D *>(Rend3D.get());
         rend3d->SetRenderSettings(settings.ScaleFactor, settings.HiresCoordinates);
     }
     else
+#endif
     {
         auto rend3d = dynamic_cast<GLRenderer3D *>(Rend3D.get());
         rend3d->SetRenderSettings(settings.ScaleFactor, settings.BetterPolygons);
@@ -571,12 +578,12 @@ void GLRenderer::RenderScreen(int ystart, int yend)
             if ((AuxUsageMask & (1<<0)) && (vramcap == -1))
             {
                 glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, 256, 256, 1, GL_RGBA,
-                                GL_UNSIGNED_SHORT_1_5_5_5_REV, AuxInputBuffer[0]);
+                                OpenGL::PixelType1555, OpenGL::Prepare1555Upload(AuxInputBuffer[0], 256 * 256));
             }
             if (AuxUsageMask & (1<<1))
             {
                 glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 1, 256, 192, 1, GL_RGBA,
-                                GL_UNSIGNED_SHORT_1_5_5_5_REV, AuxInputBuffer[1]);
+                                OpenGL::PixelType1555, OpenGL::Prepare1555Upload(AuxInputBuffer[1], 256 * 192));
             }
         }
 
@@ -879,8 +886,7 @@ void GLRenderer::SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete)
 
         glBindFramebuffer(GL_READ_FRAMEBUFFER, CaptureSyncFB);
 
-        glReadPixels(0, 0, 128, 128,
-                     GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, &vram[start * 64 * 512]);
+        OpenGL::ReadPixels1555(0, 0, 128, 128, (u16*)&vram[start * 64 * 512]);
 
         for (u32 j = start * 64; j < (start+1) * 64; j++)
             GPU.VRAMDirty[bank][j] = true;
@@ -898,8 +904,7 @@ void GLRenderer::SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete)
             if (end > 4)
                 end = 4;
 
-            glReadPixels(0, pos * 64, 256, (end - pos) * 64,
-                         GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, &vram[pos * 64 * 512]);
+            OpenGL::ReadPixels1555(0, pos * 64, 256, (end - pos) * 64, (u16*)&vram[pos * 64 * 512]);
 
             for (u32 j = pos * 64; j < end * 64; j++)
                 GPU.VRAMDirty[bank][j] = true;

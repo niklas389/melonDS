@@ -185,6 +185,92 @@ writeError:
     NewShaders.clear();
 }
 
+const void* Prepare1555Upload(const u16* src, size_t count)
+{
+#ifdef OGLRENDERER_GLES
+    static std::vector<u16> converted;
+    converted.resize(count);
+    for (size_t i = 0; i < count; i++)
+    {
+        u16 c = src[i];
+        converted[i] = ((c & 0x001F) << 11) | ((c & 0x03E0) << 1) | ((c & 0x7C00) >> 9) | (c >> 15);
+    }
+    return converted.data();
+#else
+    return src;
+#endif
+}
+
+void ReadPixels1555(GLint x, GLint y, GLsizei width, GLsizei height, u16* dst)
+{
+#ifdef OGLRENDERER_GLES
+    // OpenGL ES only guarantees GL_RGBA + GL_UNSIGNED_BYTE for glReadPixels
+    static std::vector<u8> rgba;
+    size_t count = (size_t)width * height;
+    rgba.resize(count * 4);
+    glReadPixels(x, y, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+    for (size_t i = 0; i < count; i++)
+    {
+        const u8* p = &rgba[i * 4];
+        dst[i] = (p[0] >> 3) | ((p[1] >> 3) << 5) | ((p[2] >> 3) << 10) | ((p[3] >> 7) << 15);
+    }
+#else
+    glReadPixels(x, y, width, height, GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, dst);
+#endif
+}
+
+#ifdef OGLRENDERER_GLES
+// The shaders are written for GLSL 1.40; GLSL ES 3.00 is close enough
+// once it gets its own version line, default precisions,
+// and explicit locations for the fragment outputs (it has no glBindFragDataLocation).
+static std::string ToGLSLES(const std::string& source, const std::initializer_list<AttributeTarget>& fragmentOutAttrs)
+{
+    std::string result = source;
+    size_t version = result.find("#version");
+    if (version != std::string::npos)
+    {
+        size_t end = result.find('\n', version);
+        result.erase(version, end == std::string::npos ? std::string::npos : end - version);
+    }
+
+    for (const AttributeTarget& target : fragmentOutAttrs)
+    {
+        // Find "out <type> <name>;" and give it a location
+        std::string name = target.Name;
+        for (size_t pos = result.find(name); pos != std::string::npos; pos = result.find(name, pos + 1))
+        {
+            if (pos == 0 || (result[pos - 1] != ' ' && result[pos - 1] != '\t'))
+                continue;
+
+            size_t after = pos + name.size();
+            size_t semicolon = result.find_first_not_of(" \t", after);
+            if (semicolon == std::string::npos || result[semicolon] != ';')
+                continue;
+
+            size_t lineStart = result.rfind('\n', pos);
+            lineStart = (lineStart == std::string::npos) ? 0 : lineStart + 1;
+            size_t out = result.find_first_not_of(" \t", lineStart);
+            if (out == std::string::npos || result.compare(out, 4, "out ") != 0 || out > pos)
+                continue;
+
+            std::string layout = "layout(location = " + std::to_string(target.Location) + ") ";
+            result.insert(out, layout);
+            break;
+        }
+    }
+
+    return "#version 300 es\n"
+           "precision highp float;\n"
+           "precision highp int;\n"
+           "precision highp sampler2D;\n"
+           "precision highp sampler2DArray;\n"
+           "precision highp usampler2D;\n"
+           "precision highp usampler2DArray;\n"
+           "precision highp isampler2D;\n"
+           + result;
+}
+#endif
+
 bool CompilerShader(GLuint& id, const std::string& source, const std::string& name, const std::string& type)
 {
     int res;
@@ -330,21 +416,30 @@ bool CompileVertexFragmentProgram(GLuint& result,
 
     bool linkingSucess = false;
 
+#ifdef OGLRENDERER_GLES
+    if (!CompilerShader(shaders[0], ToGLSLES(vs, {}), name, "vertex"))
+        goto error;
+
+    if (!CompilerShader(shaders[1], ToGLSLES(fs, fragmentOutAttrs), name, "fragment"))
+        goto error;
+#else
     if (!CompilerShader(shaders[0], vs, name, "vertex"))
         goto error;
 
     if (!CompilerShader(shaders[1], fs, name, "fragment"))
         goto error;
-
+#endif
 
     for (const AttributeTarget& target : vertexInAttrs)
     {
         glBindAttribLocation(result, target.Location, target.Name);
     }
+#ifndef OGLRENDERER_GLES
     for (const AttributeTarget& target : fragmentOutAttrs)
     {
         glBindFragDataLocation(result, target.Location, target.Name);
     }
+#endif
 
     linkingSucess = LinkProgram(result, shaders, 2);
 

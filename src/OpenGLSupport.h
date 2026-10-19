@@ -25,8 +25,28 @@
 #include "Platform.h"
 #include "PlatformOGL.h"
 
+#ifndef GL_CLAMP_TO_BORDER
+#define GL_CLAMP_TO_BORDER 0x812D // OpenGL ES 3.2
+#endif
+
 namespace melonDS::OpenGL
 {
+
+// The DS's 15-bit color format (BGR555, bit 15 = alpha) matches GL_UNSIGNED_SHORT_1_5_5_5_REV,
+// which OpenGL ES doesn't have. There, textures of this format use GL_UNSIGNED_SHORT_5_5_5_1
+// and the pixels are converted on upload and on readback.
+#ifdef OGLRENDERER_GLES
+constexpr GLenum PixelType1555 = GL_UNSIGNED_SHORT_5_5_5_1;
+#else
+constexpr GLenum PixelType1555 = GL_UNSIGNED_SHORT_1_5_5_5_REV;
+#endif
+
+// Returns pixels in the layout PixelType1555 expects;
+// on OpenGL ES this is a converted copy that stays valid until the next call.
+const void* Prepare1555Upload(const u16* src, size_t count);
+
+// Reads back an RGB5_A1 framebuffer region into the DS's 15-bit color format
+void ReadPixels1555(GLint x, GLint y, GLsizei width, GLsizei height, u16* dst);
 
 void LoadShaderCache();
 void SaveShaderCache();

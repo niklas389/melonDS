@@ -89,7 +89,9 @@ SoftRenderer::SoftRenderer(melonDS::NDS& nds)
     Soft2D_B = rend2D_B.get();
     Rend2D_A = std::move(rend2D_A);
     Rend2D_B = std::move(rend2D_B);
-    Rend3D = std::make_unique<SoftRenderer3D>(GPU.GPU3D, *this);
+    auto rend3D = std::make_unique<SoftRenderer3D>(GPU.GPU3D, *this);
+    Soft3D = rend3D.get();
+    Rend3D = std::move(rend3D);
 
     Sema_Work = Platform::Semaphore_Create();
     Sema_Done = Platform::Semaphore_Create();
@@ -195,8 +197,17 @@ void SoftRenderer::DrawScanline(u32 line)
 
         if (vcount < 192)
         {
+            // the 3D renderer's buffer only changes when the next frame starts, after the queue is drained
             u32* line3D = Rend3D->GetLine(vcount);
-            memcpy(job.Line3D, line3D, sizeof(job.Line3D));
+            if (Soft3D->IsStableLine(line3D))
+            {
+                job.Line3DPtr = line3D;
+            }
+            else
+            {
+                memcpy(job.Line3D, line3D, sizeof(job.Line3D));
+                job.Line3DPtr = job.Line3D;
+            }
 
             BeginJobState(job);
             UpdateBGVRAM(GPU.GPU2D_A);
@@ -676,6 +687,19 @@ void SoftRenderer::SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete)
         CaptureImmediate = true;
 }
 
+void SoftRenderer::Start3DRendering()
+{
+    // queued scanlines may still read the 3D renderer's buffer
+    WaitIdle();
+    Rend3D->RenderFrame();
+}
+
+void SoftRenderer::Restart3DRendering()
+{
+    WaitIdle();
+    Rend3D->RestartFrame();
+}
+
 void SoftRenderer::SwapBuffers()
 {
     // finish the frame before it is shown
@@ -804,7 +828,7 @@ void SoftRenderer::RunJob(Job2D& job)
         return;
     }
 
-    Output3D = job.Line3D;
+    Output3D = const_cast<u32*>(job.Line3DPtr);
     RenderScanline(job.VCount, job.DstA, job.DstB, job.ScreensEnabled,
                    job.HasDisplayLine ? job.DisplayLine : nullptr,
                    job.BrightnessA, job.BrightnessB);

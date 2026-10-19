@@ -579,6 +579,29 @@ void DMA::Run9()
             if (NDS.ARM9Timestamp >= NDS.ARM9Target) break;
         }
     }
+    else if (DstAddrInc == 0 && ((CurDstAddr & ~0x3) - 0x04000400) < 0x1CC && NDS.ConsoleType == 0)
+    {
+        // DS geometry commands (usually from main RAM): the same accesses as below,
+        // without going through the generic bus dispatch for each word
+        u32 dstaddr = CurDstAddr & ~0x3;
+        while (IterCount > 0 && !Stall)
+        {
+            NDS.ARM9Timestamp += (UnitTimings9_32(burststart) << NDS.ARM9ClockShift);
+            burststart = false;
+
+            u32 srcaddr = CurSrcAddr & ~0x3;
+            u32 val = ((srcaddr & 0xFF000000) == 0x02000000)
+                ? *(u32*)&NDS.MainRAM[srcaddr & NDS.MainRAMMask]
+                : NDS.ARM9Read32(CurSrcAddr);
+            NDS.GPU.GPU3D.Write32(dstaddr, val);
+
+            CurSrcAddr += SrcAddrInc<<2;
+            IterCount--;
+            RemCount--;
+
+            if (NDS.ARM9Timestamp >= NDS.ARM9Target) break;
+        }
+    }
     else
     {
         while (IterCount > 0 && !Stall)

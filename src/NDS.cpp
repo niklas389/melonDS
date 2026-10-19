@@ -3448,6 +3448,13 @@ void NDS::ARM9IOWrite16(u32 addr, u16 val)
 
 void NDS::ARM9IOWrite32(u32 addr, u32 val)
 {
+    // geometry FIFO and command ports, the most frequent IO writes in 3D games
+    if ((addr - 0x04000400) < 0x1CC)
+    {
+        GPU.GPU3D.Write32(addr, val);
+        return;
+    }
+
     switch (addr)
     {
     case 0x04000004:

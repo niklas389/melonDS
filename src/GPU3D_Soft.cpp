@@ -1799,8 +1799,52 @@ void SoftRenderer3D::RenderPolygons(bool threaded, Polygon** polygons, int npoly
         Platform::Semaphore_Post(Sema_ScanlineCount);
 }
 
+s32 SoftRenderer3D::ChooseSplitLine(Polygon** polygons, int npolys) const
+{
+    // estimate the work per scanline: a fixed cost per polygon plus its width
+    s32 delta[193] {};
+    s64 total = 0;
+    for (int i = 0; i < npolys; i++)
+    {
+        const Polygon* polygon = polygons[i];
+        if (polygon->Degenerate) continue;
+
+        s32 ytop = std::clamp<s32>(polygon->YTop, 0, 191);
+        s32 ybot = (polygon->YBottom == polygon->YTop) ? polygon->YTop + 1 : polygon->YBottom;
+        ybot = std::clamp<s32>(ybot, ytop + 1, 192);
+
+        s32 xmin = 256, xmax = 0;
+        for (u32 v = 0; v < polygon->NumVertices; v++)
+        {
+            s32 x = polygon->Vertices[v]->FinalPosition[0];
+            xmin = std::min(xmin, x);
+            xmax = std::max(xmax, x);
+        }
+        s32 cost = 32 + std::clamp<s32>(xmax - xmin, 0, 256);
+
+        delta[ytop] += cost;
+        delta[ybot] -= cost;
+        total += (s64)cost * (ybot - ytop);
+    }
+
+    // the top half is needed first, so it gets a little less than half
+    s64 target = total * 9 / 20;
+    s64 sum = 0;
+    s32 cost = 0;
+    s32 line = 0;
+    for (; line < 192; line++)
+    {
+        cost += delta[line];
+        if (sum + cost > target) break;
+        sum += cost;
+    }
+
+    return std::clamp<s32>(line, 8, 184);
+}
+
 void SoftRenderer3D::RenderPolygonsSplit(Polygon** polygons, int npolys)
 {
+    SplitLine = ChooseSplitLine(polygons, npolys);
     TopHalfDone = false;
     TopReady = 0;
     BoundaryReady = false;

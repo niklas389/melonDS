@@ -48,6 +48,13 @@ public:
 
     u32* GetLine(int line) override;
 
+    // whether a line returned by GetLine stays valid until the next frame starts rendering
+    // (otherwise it's a scratch buffer that the next GetLine call overwrites)
+    [[nodiscard]] bool IsStableLine(const u32* line) const noexcept
+    {
+        return line >= ColorBuffer && line < ColorBuffer + (BufferSize * 2);
+    }
+
     void SetupRenderThread();
     void EnableRenderThread();
     void StopRenderThread();
@@ -542,7 +549,9 @@ private:
         thread in order, as soon as they are final.
     */
 
-    static constexpr s32 SplitLine = 96;
+    // chosen for each frame so that both threads get about the same amount of work
+    s32 SplitLine = 96;
+    s32 ChooseSplitLine(Polygon** polygons, int npolys) const;
 
     bool Split = false;
     Platform::Thread* SplitThread = nullptr;

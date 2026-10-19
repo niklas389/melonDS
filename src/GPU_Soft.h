@@ -56,6 +56,9 @@ public:
     bool GetFramebuffers(void** top, void** bottom) override;
     void SwapBuffers() override;
 
+    void Start3DRendering() override;
+    void Restart3DRendering() override;
+
 private:
     friend class SoftRenderer2D;
     friend class SoftRenderer3D;
@@ -67,6 +70,7 @@ private:
     melonDS::GPU2D State2D_B;
     SoftRenderer2D* Soft2D_A;
     SoftRenderer2D* Soft2D_B;
+    SoftRenderer3D* Soft3D;
 
     u32* Framebuffer[2][2];
 
@@ -120,6 +124,8 @@ private:
         u32 OAMCopy;
         GPU2DState State[2];
 
+        // the 3D scanline: in the 3D renderer's buffer, or copied to Line3D
+        const u32* Line3DPtr;
         alignas(8) u32 Line3D[256];
         alignas(8) u16 DisplayLine[256];    // VRAM or FIFO display source for engine A
         alignas(8) u16 CaptureB[256];       // capture source B

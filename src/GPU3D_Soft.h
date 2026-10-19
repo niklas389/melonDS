@@ -86,6 +86,8 @@ private:
     // interpolation, avoiding precision loss from the aforementioned approximation.
     // Which is desirable when using the GPU to draw 2D graphics.
 
+    class SpanInterpolator;
+
     template<int dir>
     class Interpolator
     {
@@ -228,7 +230,11 @@ private:
             }
         }
 
+        constexpr bool IsLinear() const { return linear; }
+
     private:
+        friend class SpanInterpolator;
+
         s32 x0, x1, xdiff, x;
 
         int shift;
@@ -239,6 +245,143 @@ private:
         s32 w0n, w0d, w1d;
 
         u32 yfactor;
+    };
+
+    // Interpolator<0> for the pixels of one span, set up so that a pixel takes at most one division, for the
+    // perspective factor, and a multiply-add or two per attribute. It gives the same results as SetX()
+    // followed by Interpolate() and InterpolateZ(), including their unsigned wraparound.
+    class SpanInterpolator
+    {
+    public:
+        // y0 + (((y1-y0) * factor) >> 8), or y1 + (((y0-y1) * (256-factor)) >> 8) if y0 > y1
+        struct Attr
+        {
+            u32 Base, C, D;
+
+            Attr() : Base(0), C(0), D(0) {}
+            Attr(s32 y0, s32 y1)
+            {
+                if (y0 <= y1)
+                {
+                    Base = y0; C = 0; D = y1 - y0;
+                }
+                else
+                {
+                    Base = y1; C = (u32)(y0 - y1) << 8; D = -(u32)(y0 - y1);
+                }
+            }
+
+            constexpr s32 At(u32 factor) const { return (s32)(Base + ((C + D * factor) >> 8)); }
+        };
+
+        // linear mode: y0 + (y1-y0) * (x-x0) / xdiff, or y1 + (y0-y1) * (xdiff-(x-x0)) / xdiff if y0 > y1;
+        // the division is a multiplication by the reciprocal of xdiff rounded up, which gives the same
+        // quotient for dividends below 2^31 (Granlund and Montgomery 1994, theorem 4.2)
+        struct LinearAttr
+        {
+            u32 Base, D;
+            s32 FBase, FSign;
+        };
+
+        LinearAttr Linear(s32 y0, s32 y1) const
+        {
+            LinearAttr attr;
+            if (y0 <= y1)
+            {
+                attr.Base = y0; attr.D = y1 - y0;
+                attr.FBase = -X0; attr.FSign = 1;
+            }
+            else
+            {
+                attr.Base = y1; attr.D = y0 - y1;
+                attr.FBase = XDiff + X0; attr.FSign = -1;
+            }
+            return attr;
+        }
+
+        // whether Linear() gives the same results as Interpolator<0> for these values, given that
+        // 0 <= x-x0 < xdiff
+        bool LinearExact(s32 y0, s32 y1) const
+        {
+            s64 d = (y0 <= y1) ? (s64)y1 - y0 : (s64)y0 - y1;
+            return d * XDiff < (1ll << 31);
+        }
+
+        constexpr s32 At(const LinearAttr& attr, s32 x) const
+        {
+            u32 f = attr.FBase + attr.FSign * x;
+            return (s32)(attr.Base + (u32)(((u64)(attr.D * f) * Recip) >> RecipShift));
+        }
+
+        SpanInterpolator(const Interpolator<0>& interp, s32 z0, s32 z1)
+        {
+            X0 = interp.x0;
+            XDiff = interp.xdiff;
+            if (XDiff > 0)
+            {
+                int l = 0;
+                while ((1 << l) < XDiff) l++;
+                RecipShift = 31 + l;
+                Recip = ((1ull << RecipShift) + XDiff - 1) / XDiff;
+            }
+            else
+            {
+                RecipShift = 0;
+                Recip = 0;
+            }
+
+            NumStep = (u32)interp.w0n << 8;
+            DenStep = (u32)interp.w0d - (u32)interp.w1d;
+            DenBase = (u32)interp.xdiff * (u32)interp.w1d;
+
+            WBuffer = interp.wbuffer;
+            ZFlip = !(z0 < z1);
+            ZBase = ZFlip ? z1 : z0;
+            if (WBuffer)
+            {
+                ZDisp = (s64)(ZFlip ? z0 - z1 : z1 - z0);
+            }
+            else
+            {
+                ZDisp = (s64)((ZFlip ? z0 - z1 : z1 - z0) >> 9) * interp.xrecip_z;
+                ZFactorBase = ZFlip ? interp.xdiff + interp.x0 : -interp.x0;
+            }
+        }
+
+        // the perspective factor at x
+        constexpr u32 Factor(s32 x) const
+        {
+            u32 rel = (u32)(x - X0);
+            u32 num = rel * NumStep;
+            u32 den = rel * DenStep + DenBase;
+            return den ? (num / den) : 0;
+        }
+
+        constexpr s32 Z(s32 x, u32 factor) const
+        {
+            if (WBuffer)
+            {
+                // the original takes (1<<8) - factor as unsigned
+                u32 f = ZFlip ? (256 - factor) : factor;
+                return (s32)(ZBase + ((ZDisp * (s64)f) >> 8));
+            }
+            else
+            {
+                s32 f = ZFlip ? (ZFactorBase - x) : (ZFactorBase + x);
+                return (s32)(ZBase + ((ZDisp * f) >> 13));
+            }
+        }
+
+    private:
+        s32 X0, XDiff;
+        u64 Recip;
+        int RecipShift;
+        u32 NumStep, DenStep, DenBase;
+
+        bool WBuffer, ZFlip;
+        s32 ZBase;
+        s32 ZFactorBase = 0;
+        s64 ZDisp;
     };
 
 
@@ -461,8 +604,6 @@ private:
 
     RendererPolygon PolygonList[2048];
 
-    // the per-thread rasterizer state: polygon edges, and the stencil buffer for shadows,
-    // which carries over between scanlines of the same parity
     // the scanlines a polygon is drawn on, top <= y < bottom; kept apart from the polygons
     // so that finding the ones on a scanline doesn't need to touch them
     struct LineRange
@@ -477,6 +618,8 @@ private:
     }
     LineRange PolygonRanges[2048];
 
+    // the per-thread rasterizer state: polygon edges, and the stencil buffer for shadows,
+    // which carries over between scanlines of the same parity
     struct RasterContext
     {
         RendererPolygon* Polygons;
@@ -485,9 +628,40 @@ private:
         bool PrevIsShadowMask;
     };
 
-    void TextureLookup(u32 texparam, u32 texpal, s16 s, s16 t, u16* color, u8* alpha) const;
-    u32 RenderPixel(const Polygon* polygon, u8 vr, u8 vg, u8 vb, s16 s, s16 t) const;
+    // what shading a polygon's pixels needs, copied out of the polygon and the render state for each span,
+    // so that it stays in registers while the span's pixels are written
+    struct PixelShading
+    {
+        u32 BlendMode, PolyAlpha;
+        bool Wireframe, Highlight, Textured;
+        u32 TexParam, TexPalette;
+    };
+
+    // a polygon's span on one scanline, as set up by RenderPolygonScanline for DrawSpan
+    struct SpanSetup
+    {
+        s32 XStart, XEnd;
+        bool LFillEdge, RFillEdge;
+        s32 LEdgeLen, REdgeLen;
+        s32 LEdgeCov, REdgeCov;
+        int YEdge;
+        u32 PolyAttr;
+        bool Wireframe;
+
+        Interpolator<0> InterpX;
+        s32 ZL, ZR;
+        s32 RL, GL, BL, SL, TL;
+        s32 RR, GR, BR, SR, TR;
+    };
+
+    [[gnu::always_inline]] inline void TextureLookup(u32 texparam, u32 texpal, s16 s, s16 t, u16* color, u8* alpha) const;
+    [[gnu::always_inline]] inline u32 RenderPixel(const PixelShading& shading, u8 vr, u8 vg, u8 vb, s16 s, s16 t) const;
     void PlotTranslucentPixel(u32 pixeladdr, u32 color, u32 z, u32 polyattr, u32 shadow);
+    // how a span's attributes are interpolated: with SpanInterpolator, perspective-correct or linear,
+    // or with Interpolator<0> for linear spans whose values are too far apart for SpanInterpolator
+    enum class SpanMode { Perspective, Linear, Generic };
+    template <SpanMode Mode>
+    void DrawSpan(RasterContext& ctx, const Polygon* polygon, const SpanSetup& span, s32 y);
     void SetupPolygonLeftEdge(RendererPolygon* rp, s32 y) const;
     void SetupPolygonRightEdge(RendererPolygon* rp, s32 y) const;
     void SetupPolygon(RendererPolygon* rp, Polygon* polygon) const;

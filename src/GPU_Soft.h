@@ -133,7 +133,8 @@ private:
     };
 
     static constexpr u32 NumJobs = 512;
-    static constexpr u32 NumMemCopies = 32;
+    // enough for a new palette or OAM copy on every scanline of a frame
+    static constexpr u32 NumMemCopies = 256;
 
     bool Threaded2D = false;
     Platform::Thread* Thread2D = nullptr;
@@ -171,10 +172,13 @@ private:
     Job2D& BeginJob();
     void SubmitJob();
     void BeginJobState(Job2D& job);
-    void WaitForJobs(u32 count);
+    u32 TakePaletteCopy(u32 seq);
+    u32 TakeOAMCopy(u32 seq);
+    // inlined into their callers, so that profiles show where the emulation thread waited
+    [[gnu::always_inline]] inline void WaitForJobs(u32 count);
     void RetireJobs();
-    void WaitIdle();
-    void SyncCaptures(u32 bank);
+    [[gnu::always_inline]] inline void WaitIdle();
+    [[gnu::always_inline]] inline void SyncCaptures(u32 bank);
 };
 
 }

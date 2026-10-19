@@ -867,6 +867,12 @@ void SoftRenderer::BeginJobState(Job2D& job)
     job.State[0] = GPU.GPU2D_A;
     job.State[1] = GPU.GPU2D_B;
 
+    job.PaletteCopy = TakePaletteCopy(seq);
+    job.OAMCopy = TakeOAMCopy(seq);
+}
+
+[[gnu::noinline]] u32 SoftRenderer::TakePaletteCopy(u32 seq)
+{
     if (GPU.PaletteWritten)
     {
         u32 next = (CurPaletteCopy + 1) % NumMemCopies;
@@ -876,8 +882,11 @@ void SoftRenderer::BeginJobState(Job2D& job)
         GPU.PaletteWritten = false;
     }
     PaletteCopyJobs[CurPaletteCopy] = seq + 1;
-    job.PaletteCopy = CurPaletteCopy;
+    return CurPaletteCopy;
+}
 
+[[gnu::noinline]] u32 SoftRenderer::TakeOAMCopy(u32 seq)
+{
     if (GPU.OAMWritten)
     {
         u32 next = (CurOAMCopy + 1) % NumMemCopies;
@@ -887,7 +896,7 @@ void SoftRenderer::BeginJobState(Job2D& job)
         GPU.OAMWritten = false;
     }
     OAMCopyJobs[CurOAMCopy] = seq + 1;
-    job.OAMCopy = CurOAMCopy;
+    return CurOAMCopy;
 }
 
 void SoftRenderer::SubmitJob()

@@ -124,8 +124,9 @@ private:
         u32 OAMCopy;
         GPU2DState State[2];
 
-        // the 3D scanline: in the 3D renderer's buffer, or copied to Line3D
-        const u32* Line3DPtr;
+        // the 3D scanline: at this offset in the 3D line buffer (see Line3DBase), or copied to Line3D
+        bool Line3DCopied;
+        u32 Line3DOffset;
         alignas(8) u32 Line3D[256];
         alignas(8) u16 DisplayLine[256];    // VRAM or FIFO display source for engine A
         alignas(8) u16 CaptureB[256];       // capture source B
@@ -143,11 +144,18 @@ private:
     std::atomic<bool> StopThread2D {false};
     std::atomic<bool> WorkerSleeping {false};
     std::atomic<bool> EmuWaiting {false};
+    std::atomic<u32> EmuWaitTarget {0};
 
     // job counts: submitted by the emulation thread, done by the render thread,
     // retired (captures written) by the emulation thread
     std::atomic<u32> JobsSubmitted {0};
+    std::atomic<u32> JobsStarted {0};
     std::atomic<u32> JobsDone {0};
+
+    // where queued scanlines read their 3D lines: the 3D renderer's buffer, or a copy of it taken
+    // when the next 3D frame starts while scanlines of this one are still queued
+    std::atomic<const u32*> Line3DBase {nullptr};
+    std::unique_ptr<u32[]> Line3DSnapshot;
     u32 JobsRetired = 0;
 
     // job count that must be reached before the captures to each VRAM bank are all written

@@ -52,8 +52,12 @@ public:
     // (otherwise it's a scratch buffer that the next GetLine call overwrites)
     [[nodiscard]] bool IsStableLine(const u32* line) const noexcept
     {
-        return line >= ColorBuffer && line < ColorBuffer + (BufferSize * 2);
+        return line >= ColorBuffer && line < ColorBuffer + LineBufferSize;
     }
+
+    // the part of the color buffer that GetLine's stable lines are in
+    static constexpr size_t LineBufferSize = 258 * 194;
+    [[nodiscard]] const u32* LineBuffer() const noexcept { return ColorBuffer; }
 
     void SetupRenderThread();
     void EnableRenderThread();
@@ -496,6 +500,7 @@ private:
     static constexpr int ScanlineWidth = 258;
     static constexpr int NumScanlines = 194;
     static constexpr int BufferSize = ScanlineWidth * NumScanlines;
+    static_assert(LineBufferSize == BufferSize);
     static constexpr int FirstPixelOffset = ScanlineWidth + 1;
 
     u32 ColorBuffer[BufferSize * 2];

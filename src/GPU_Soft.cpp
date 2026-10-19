@@ -197,17 +197,13 @@ void SoftRenderer::DrawScanline(u32 line)
 
         if (vcount < 192)
         {
-            // the 3D renderer's buffer only changes when the next frame starts, after the queue is drained
+            // the 3D renderer's buffer only changes when the next frame starts (see Start3DRendering)
             u32* line3D = Rend3D->GetLine(vcount);
-            if (Soft3D->IsStableLine(line3D))
-            {
-                job.Line3DPtr = line3D;
-            }
-            else
-            {
+            job.Line3DCopied = !Soft3D->IsStableLine(line3D);
+            if (job.Line3DCopied)
                 memcpy(job.Line3D, line3D, sizeof(job.Line3D));
-                job.Line3DPtr = job.Line3D;
-            }
+            else
+                job.Line3DOffset = line3D - Soft3D->LineBuffer();
 
             BeginJobState(job);
             UpdateBGVRAM(GPU.GPU2D_A);
@@ -689,8 +685,19 @@ void SoftRenderer::SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete)
 
 void SoftRenderer::Start3DRendering()
 {
-    // queued scanlines may still read the 3D renderer's buffer
-    WaitIdle();
+    // queued scanlines may still read the 3D renderer's buffer, which the new frame overwrites;
+    // rather than waiting for them, let them read a copy
+    if (Threaded2D && JobsSubmitted.load(std::memory_order_relaxed) != JobsDone.load())
+    {
+        if (!Line3DSnapshot)
+            Line3DSnapshot = std::make_unique<u32[]>(SoftRenderer3D::LineBufferSize);
+        memcpy(Line3DSnapshot.get(), Soft3D->LineBuffer(), SoftRenderer3D::LineBufferSize * sizeof(u32));
+        Line3DBase.store(Line3DSnapshot.get());
+
+        // only the scanline in progress may have taken the old address
+        WaitForJobs(JobsStarted.load());
+    }
+
     Rend3D->RenderFrame();
 }
 
@@ -704,6 +711,7 @@ void SoftRenderer::SwapBuffers()
 {
     // finish the frame before it is shown
     WaitIdle();
+    Line3DBase.store(Soft3D->LineBuffer());
 
     BackBuffer ^= 1;
 }
@@ -724,8 +732,10 @@ void SoftRenderer::SetThreaded2D(bool threaded)
         }
 
         JobsSubmitted = 0;
+        JobsStarted = 0;
         JobsDone = 0;
         JobsRetired = 0;
+        Line3DBase = Soft3D->LineBuffer();
         memset(CaptureJobs, 0, sizeof(CaptureJobs));
         CaptureImmediate = false;
         memset(PaletteCopyJobs, 0, sizeof(PaletteCopyJobs));
@@ -794,12 +804,15 @@ void SoftRenderer::RenderThread2DFunc()
             continue;
         }
 
+        // see Start3DRendering
+        JobsStarted.store(done + 1);
         RunJob(Jobs[done % NumJobs]);
 
         done++;
         JobsDone.store(done);
 
-        if (EmuWaiting.load() && EmuWaiting.exchange(false))
+        // wake the emulation thread once the job it waits for is done
+        if (EmuWaiting.load() && (s32)(done - EmuWaitTarget.load()) >= 0 && EmuWaiting.exchange(false))
             Platform::Semaphore_Post(Sema_Done);
     }
 }
@@ -828,7 +841,10 @@ void SoftRenderer::RunJob(Job2D& job)
         return;
     }
 
-    Output3D = const_cast<u32*>(job.Line3DPtr);
+    if (job.Line3DCopied)
+        Output3D = job.Line3D;
+    else
+        Output3D = const_cast<u32*>(Line3DBase.load() + job.Line3DOffset);
     RenderScanline(job.VCount, job.DstA, job.DstB, job.ScreensEnabled,
                    job.HasDisplayLine ? job.DisplayLine : nullptr,
                    job.BrightnessA, job.BrightnessB);
@@ -916,7 +932,8 @@ void SoftRenderer::WaitForJobs(u32 count)
 
     for (;;)
     {
-        // the render thread posts Sema_Done if it sees this flag after finishing a job
+        // the render thread posts Sema_Done if it sees this flag after finishing the job we wait for
+        EmuWaitTarget = count;
         EmuWaiting = true;
         if (reached())
         {

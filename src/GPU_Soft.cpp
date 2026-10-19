@@ -18,6 +18,7 @@
 
 #include <chrono>
 #include <string.h>
+#include <thread>
 
 #include "NDS.h"
 #include "GPU_Soft.h"
@@ -38,19 +39,31 @@ inline void CPURelax()
 }
 
 // busy-wait for a condition, for at most the given time
-// cheaper than sleeping when the other thread is expected to be quick
+// cheaper than sleeping when the other thread is expected to be quick;
+// after a short while, it lets other threads have the core if they need it
 template <typename F>
 bool SpinUntil(F&& done, std::chrono::microseconds limit)
 {
+    constexpr std::chrono::microseconds yieldAfter(20);
     auto start = std::chrono::steady_clock::now();
+    bool yield = false;
     for (u32 i = 1;; i++)
     {
         if (done())
             return true;
 
-        CPURelax();
-        if (((i & 0x3F) == 0) && ((std::chrono::steady_clock::now() - start) > limit))
-            return done();
+        if (yield)
+            std::this_thread::yield();
+        else
+            CPURelax();
+
+        if ((i & 0x3F) == 0 || yield)
+        {
+            auto elapsed = std::chrono::steady_clock::now() - start;
+            if (elapsed > limit)
+                return done();
+            yield = elapsed > yieldAfter;
+        }
     }
 }
 
@@ -144,6 +157,7 @@ void SoftRenderer::SetRenderSettings(RendererSettings& settings)
 {
     auto rend3d = dynamic_cast<SoftRenderer3D*>(Rend3D.get());
     rend3d->SetThreaded(settings.Threaded);
+    rend3d->SetSplit(settings.Split3D);
 
     SetThreaded2D(settings.Threaded2D);
 }

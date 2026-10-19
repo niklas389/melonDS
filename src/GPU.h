@@ -838,6 +838,9 @@ struct RendererSettings
 
     // whether the software renderer draws the 2D engines on a separate thread
     bool Threaded2D = false;
+
+    // whether the threaded software 3D renderer uses a second thread for the bottom half of the frame
+    bool Split3D = false;
 };
 
 class Renderer

@@ -43,6 +43,44 @@ void SoftRenderer3D::StopRenderThread()
         Platform::Thread_Free(RenderThread);
         RenderThread = nullptr;
     }
+
+    StopSplitThread();
+}
+
+void SoftRenderer3D::StartSplitThread()
+{
+    if (SplitThreadRunning.load(std::memory_order_relaxed))
+        return;
+
+    Platform::Semaphore_Reset(Sema_SplitStart);
+    Platform::Semaphore_Reset(Sema_SplitDone);
+    SplitThreadRunning = true;
+    SplitThread = Platform::Thread_Create([this]() { SplitThreadFunc(); });
+    if (!SplitThread)
+        SplitThreadRunning = false;
+}
+
+void SoftRenderer3D::StopSplitThread()
+{
+    // only called while the render thread isn't drawing a frame
+    if (!SplitThreadRunning.load(std::memory_order_relaxed))
+        return;
+
+    SplitThreadRunning = false;
+    Platform::Semaphore_Post(Sema_SplitStart);
+    Platform::Thread_Wait(SplitThread);
+    Platform::Thread_Free(SplitThread);
+    SplitThread = nullptr;
+}
+
+void SoftRenderer3D::SetSplit(bool split) noexcept
+{
+    if (Split != split)
+    {
+        Split = split;
+        SetupRenderThread();
+        EnableRenderThread();
+    }
 }
 
 void SoftRenderer3D::SetupRenderThread()
@@ -80,6 +118,12 @@ void SoftRenderer3D::SetupRenderThread()
         // "I might need some of your scanlines before you finish the whole buffer,"
         // "so let me know as soon as you're done with each one."
         Platform::Semaphore_Reset(Sema_ScanlineCount);
+
+        // the render thread is idle now, so the split thread can come or go
+        if (Split)
+            StartSplitThread();
+        else
+            StopSplitThread();
     }
     else
     {
@@ -101,6 +145,9 @@ SoftRenderer3D::SoftRenderer3D(melonDS::GPU3D& gpu3D, SoftRenderer& parent) noex
     Sema_RenderStart = Platform::Semaphore_Create();
     Sema_RenderDone = Platform::Semaphore_Create();
     Sema_ScanlineCount = Platform::Semaphore_Create();
+    Sema_SplitStart = Platform::Semaphore_Create();
+    Sema_SplitDone = Platform::Semaphore_Create();
+    Sema_TopHalfDone = Platform::Semaphore_Create();
 
     RenderThreadRunning = false;
     RenderThreadRendering = false;
@@ -114,17 +161,22 @@ SoftRenderer3D::~SoftRenderer3D()
     Platform::Semaphore_Free(Sema_RenderStart);
     Platform::Semaphore_Free(Sema_RenderDone);
     Platform::Semaphore_Free(Sema_ScanlineCount);
+    Platform::Semaphore_Free(Sema_SplitStart);
+    Platform::Semaphore_Free(Sema_SplitDone);
+    Platform::Semaphore_Free(Sema_TopHalfDone);
 }
 
 void SoftRenderer3D::Reset()
 {
+    // wait for a frame that's still being drawn before clearing what it uses
+    SetupRenderThread();
+
     memset(ColorBuffer, 0, BufferSize * 2 * 4);
     memset(DepthBuffer, 0, BufferSize * 2 * 4);
     memset(AttrBuffer, 0, BufferSize * 2 * 4);
 
     PrevIsShadowMask = false;
 
-    SetupRenderThread();
     EnableRenderThread();
 }
 
@@ -708,7 +760,7 @@ void SoftRenderer3D::SetupPolygon(SoftRenderer3D::RendererPolygon* rp, Polygon* 
     }
 }
 
-void SoftRenderer3D::RenderShadowMaskScanline(RendererPolygon* rp, s32 y)
+void SoftRenderer3D::RenderShadowMaskScanline(RasterContext& ctx, RendererPolygon* rp, s32 y)
 {
     Polygon* polygon = rp->PolyData;
 
@@ -726,10 +778,10 @@ void SoftRenderer3D::RenderShadowMaskScanline(RendererPolygon* rp, s32 y)
     else
         fnDepthTest = DepthTest_LessThan;
 
-    if (!PrevIsShadowMask)
-        memset(&StencilBuffer[256 * (y&0x1)], 0, 256);
+    if (!ctx.PrevIsShadowMask)
+        memset(&ctx.StencilBuffer[256 * (y&0x1)], 0, 256);
 
-    PrevIsShadowMask = true;
+    ctx.PrevIsShadowMask = true;
 
     if (polygon->YTop != polygon->YBottom)
     {
@@ -870,13 +922,13 @@ void SoftRenderer3D::RenderShadowMaskScanline(RendererPolygon* rp, s32 y)
         u32 dstattr = AttrBuffer[pixeladdr];
 
         if (!fnDepthTest(DepthBuffer[pixeladdr], z, dstattr))
-            StencilBuffer[256*(y&0x1) + x] = 1;
+            ctx.StencilBuffer[256*(y&0x1) + x] = 1;
 
         if (dstattr & 0xF)
         {
             pixeladdr += BufferSize;
             if (!fnDepthTest(DepthBuffer[pixeladdr], z, AttrBuffer[pixeladdr]))
-                StencilBuffer[256*(y&0x1) + x] |= 0x2;
+                ctx.StencilBuffer[256*(y&0x1) + x] |= 0x2;
         }
     }
 
@@ -896,13 +948,13 @@ void SoftRenderer3D::RenderShadowMaskScanline(RendererPolygon* rp, s32 y)
         u32 dstattr = AttrBuffer[pixeladdr];
 
         if (!fnDepthTest(DepthBuffer[pixeladdr], z, dstattr))
-            StencilBuffer[256*(y&0x1) + x] = 1;
+            ctx.StencilBuffer[256*(y&0x1) + x] = 1;
 
         if (dstattr & 0xF)
         {
             pixeladdr += BufferSize;
             if (!fnDepthTest(DepthBuffer[pixeladdr], z, AttrBuffer[pixeladdr]))
-                StencilBuffer[256*(y&0x1) + x] |= 0x2;
+                ctx.StencilBuffer[256*(y&0x1) + x] |= 0x2;
         }
     }
 
@@ -922,13 +974,13 @@ void SoftRenderer3D::RenderShadowMaskScanline(RendererPolygon* rp, s32 y)
         u32 dstattr = AttrBuffer[pixeladdr];
 
         if (!fnDepthTest(DepthBuffer[pixeladdr], z, dstattr))
-            StencilBuffer[256*(y&0x1) + x] = 1;
+            ctx.StencilBuffer[256*(y&0x1) + x] = 1;
 
         if (dstattr & 0xF)
         {
             pixeladdr += BufferSize;
             if (!fnDepthTest(DepthBuffer[pixeladdr], z, AttrBuffer[pixeladdr]))
-                StencilBuffer[256*(y&0x1) + x] |= 0x2;
+                ctx.StencilBuffer[256*(y&0x1) + x] |= 0x2;
         }
     }
 
@@ -936,7 +988,7 @@ void SoftRenderer3D::RenderShadowMaskScanline(RendererPolygon* rp, s32 y)
     rp->XR = rp->SlopeR.Step();
 }
 
-void SoftRenderer3D::RenderPolygonScanline(RendererPolygon* rp, s32 y)
+void SoftRenderer3D::RenderPolygonScanline(RasterContext& ctx, RendererPolygon* rp, s32 y)
 {
     Polygon* polygon = rp->PolyData;
 
@@ -954,7 +1006,7 @@ void SoftRenderer3D::RenderPolygonScanline(RendererPolygon* rp, s32 y)
     else
         fnDepthTest = DepthTest_LessThan;
 
-    PrevIsShadowMask = false;
+    ctx.PrevIsShadowMask = false;
 
     if (polygon->YTop != polygon->YBottom)
     {
@@ -1122,7 +1174,7 @@ void SoftRenderer3D::RenderPolygonScanline(RendererPolygon* rp, s32 y)
         // check stencil buffer for shadows
         if (polygon->IsShadow)
         {
-            u8 stencil = StencilBuffer[256*(y&0x1) + x];
+            u8 stencil = ctx.StencilBuffer[256*(y&0x1) + x];
             if (!stencil)
                 continue;
             if (!(stencil & 0x1))
@@ -1218,7 +1270,7 @@ void SoftRenderer3D::RenderPolygonScanline(RendererPolygon* rp, s32 y)
         // check stencil buffer for shadows
         if (polygon->IsShadow)
         {
-            u8 stencil = StencilBuffer[256*(y&0x1) + x];
+            u8 stencil = ctx.StencilBuffer[256*(y&0x1) + x];
             if (!stencil)
                 continue;
             if (!(stencil & 0x1))
@@ -1310,7 +1362,7 @@ void SoftRenderer3D::RenderPolygonScanline(RendererPolygon* rp, s32 y)
         // check stencil buffer for shadows
         if (polygon->IsShadow)
         {
-            u8 stencil = StencilBuffer[256*(y&0x1) + x];
+            u8 stencil = ctx.StencilBuffer[256*(y&0x1) + x];
             if (!stencil)
                 continue;
             if (!(stencil & 0x1))
@@ -1394,19 +1446,19 @@ void SoftRenderer3D::RenderPolygonScanline(RendererPolygon* rp, s32 y)
     rp->XR = rp->SlopeR.Step();
 }
 
-void SoftRenderer3D::RenderScanline(s32 y, int npolys)
+void SoftRenderer3D::RenderScanline(RasterContext& ctx, s32 y, int npolys)
 {
     for (int i = 0; i < npolys; i++)
     {
-        RendererPolygon* rp = &PolygonList[i];
+        RendererPolygon* rp = &ctx.Polygons[i];
         Polygon* polygon = rp->PolyData;
 
         if (y >= polygon->YTop && (y < polygon->YBottom || (y == polygon->YTop && polygon->YBottom == polygon->YTop)))
         {
             if (polygon->IsShadowMask)
-                RenderShadowMaskScanline(rp, y);
+                RenderShadowMaskScanline(ctx, rp, y);
             else
-                RenderPolygonScanline(rp, y);
+                RenderPolygonScanline(ctx, rp, y);
         }
     }
 }
@@ -1711,6 +1763,12 @@ void SoftRenderer3D::ClearBuffers()
 
 void SoftRenderer3D::RenderPolygons(bool threaded, Polygon** polygons, int npolys)
 {
+    if (threaded && SplitThreadRunning.load(std::memory_order_relaxed))
+    {
+        RenderPolygonsSplit(polygons, npolys);
+        return;
+    }
+
     int j = 0;
     for (int i = 0; i < npolys; i++)
     {
@@ -1718,11 +1776,13 @@ void SoftRenderer3D::RenderPolygons(bool threaded, Polygon** polygons, int npoly
         SetupPolygon(&PolygonList[j++], polygons[i]);
     }
 
-    RenderScanline(0, j);
+    RasterContext ctx {PolygonList, StencilBuffer, PrevIsShadowMask};
+
+    RenderScanline(ctx, 0, j);
 
     for (s32 y = 1; y < 192; y++)
     {
-        RenderScanline(y, j);
+        RenderScanline(ctx, y, j);
         ScanlineFinalPass(y-1);
 
         if (threaded)
@@ -1732,9 +1792,231 @@ void SoftRenderer3D::RenderPolygons(bool threaded, Polygon** polygons, int npoly
 
     ScanlineFinalPass(191);
 
+    PrevIsShadowMask = ctx.PrevIsShadowMask;
+
     if (threaded)
         // If this renderer is threaded, notify the main thread that we're done with the frame.
         Platform::Semaphore_Post(Sema_ScanlineCount);
+}
+
+void SoftRenderer3D::RenderPolygonsSplit(Polygon** polygons, int npolys)
+{
+    TopHalfDone = false;
+    TopReady = 0;
+    BoundaryReady = false;
+    BottomReady = 0;
+    LinesPublished = 0;
+    Platform::Semaphore_Reset(Sema_TopHalfDone);
+
+    // the split thread sets up its own polygons from the same list
+    SplitPolygons = polygons;
+    SplitNumPolygons = npolys;
+    SplitStartPrevIsShadowMask = PrevIsShadowMask;
+    Platform::Semaphore_Post(Sema_SplitStart);
+
+    int j = 0;
+    for (int i = 0; i < npolys; i++)
+    {
+        if (polygons[i]->Degenerate) continue;
+        SetupPolygon(&PolygonList[j++], polygons[i]);
+    }
+
+    TopContext = {PolygonList, StencilBuffer, PrevIsShadowMask};
+
+    RenderScanline(TopContext, 0, j);
+    for (s32 y = 1; y < SplitLine; y++)
+    {
+        RenderScanline(TopContext, y, j);
+        ScanlineFinalPass(y-1);
+
+        std::lock_guard lock(PublishMutex);
+        TopReady = y;
+        PublishLines();
+    }
+
+    TopHalfDone.store(true, std::memory_order_release);
+    Platform::Semaphore_Post(Sema_TopHalfDone);
+
+    Platform::Semaphore_Wait(Sema_SplitDone);
+
+    // carry the rasterizer state over to the next frame as if one thread had drawn it all
+    if (SplitTookTopStencil)
+    {
+        memcpy(StencilBuffer, SplitStencilBuffer, sizeof(StencilBuffer));
+        PrevIsShadowMask = SplitContext.PrevIsShadowMask;
+    }
+    else
+    {
+        for (int parity = 0; parity < 2; parity++)
+        {
+            if (SplitStencilValid[parity])
+                memcpy(&StencilBuffer[256 * parity], &SplitStencilBuffer[256 * parity], 256);
+        }
+        // the split thread started from the top half's final shadow mask state, so this is right
+        // even if it didn't draw anything
+        PrevIsShadowMask = SplitContext.PrevIsShadowMask;
+    }
+}
+
+void SoftRenderer3D::PublishLines()
+{
+    // PublishMutex is held
+    s32 ready = BoundaryReady ? (SplitLine + 1 + BottomReady) : TopReady;
+    if (ready > LinesPublished)
+    {
+        Platform::Semaphore_Post(Sema_ScanlineCount, ready - LinesPublished);
+        LinesPublished = ready;
+    }
+}
+
+static bool PolygonCoversLine(const Polygon* polygon, s32 y)
+{
+    return y >= polygon->YTop && (y < polygon->YBottom || (y == polygon->YTop && polygon->YBottom == polygon->YTop));
+}
+
+bool SoftRenderer3D::BottomHalfNeedsTopStencil(bool& prevIsShadowMask, bool* valid) const
+{
+    // the shadow mask state at the start of SplitLine comes from the last polygon drawn before it:
+    // the last one in the list among those reaching furthest down above SplitLine
+    s32 lastLine = -1;
+    bool hasShadows = false;
+    prevIsShadowMask = SplitStartPrevIsShadowMask;
+    for (int i = 0; i < SplitNumPolygons; i++)
+    {
+        const Polygon* polygon = SplitPolygons[i];
+        if (polygon->Degenerate) continue;
+        if (polygon->IsShadowMask || polygon->IsShadow) hasShadows = true;
+
+        s32 bottom = (polygon->YBottom == polygon->YTop) ? polygon->YTop : polygon->YBottom - 1;
+        if (bottom > SplitLine - 1) bottom = SplitLine - 1;
+        if (polygon->YTop > bottom) continue;
+        if (bottom >= lastLine)
+        {
+            lastLine = bottom;
+            prevIsShadowMask = polygon->IsShadowMask;
+        }
+    }
+
+    valid[0] = valid[1] = false;
+    if (!hasShadows)
+        return false;
+
+    // follow the stencil buffer through the bottom half: it must be cleared
+    // by a shadow mask before anything reads it or adds to it
+    bool prev = prevIsShadowMask;
+    for (s32 y = SplitLine; y < 192; y++)
+    {
+        for (int i = 0; i < SplitNumPolygons; i++)
+        {
+            const Polygon* polygon = SplitPolygons[i];
+            if (polygon->Degenerate || !PolygonCoversLine(polygon, y)) continue;
+
+            if (polygon->IsShadowMask)
+            {
+                if (!prev)
+                    valid[y & 1] = true;
+                else if (!valid[y & 1])
+                    return true;
+                prev = true;
+            }
+            else
+            {
+                if (polygon->IsShadow && !valid[y & 1])
+                    return true;
+                prev = false;
+            }
+        }
+    }
+
+    return false;
+}
+
+void SoftRenderer3D::RenderBottomHalf()
+{
+    bool prevIsShadowMask;
+    SplitTookTopStencil = BottomHalfNeedsTopStencil(prevIsShadowMask, SplitStencilValid);
+
+    int j = 0;
+    for (int i = 0; i < SplitNumPolygons; i++)
+    {
+        Polygon* polygon = SplitPolygons[i];
+        if (polygon->Degenerate) continue;
+
+        RendererPolygon* rp = &SplitPolygonList[j++];
+        SetupPolygon(rp, polygon);
+
+        // stepping the edges down to SplitLine gives the same state as setting them up there
+        if (polygon->YTop < SplitLine && SplitLine < polygon->YBottom)
+        {
+            SetupPolygonLeftEdge(rp, SplitLine);
+            SetupPolygonRightEdge(rp, SplitLine);
+        }
+    }
+
+    if (SplitTookTopStencil)
+    {
+        // the bottom half depends on what the top half left in the stencil buffer
+        Platform::Semaphore_Wait(Sema_TopHalfDone);
+        memcpy(SplitStencilBuffer, StencilBuffer, sizeof(SplitStencilBuffer));
+        prevIsShadowMask = TopContext.PrevIsShadowMask;
+    }
+
+    SplitContext = {SplitPolygonList, SplitStencilBuffer, prevIsShadowMask};
+
+    bool boundaryDone = false;
+    auto finishBoundary = [&]() {
+        // the top half's final pass for SplitLine-2 is done once TopHalfDone is set
+        ScanlineFinalPass(SplitLine - 1);
+        ScanlineFinalPass(SplitLine);
+        boundaryDone = true;
+        std::lock_guard lock(PublishMutex);
+        BoundaryReady = true;
+        PublishLines();
+    };
+
+    RenderScanline(SplitContext, SplitLine, j);
+    for (s32 y = SplitLine + 1; y < 192; y++)
+    {
+        RenderScanline(SplitContext, y, j);
+
+        if (y - 1 > SplitLine)
+        {
+            ScanlineFinalPass(y - 1);
+            std::lock_guard lock(PublishMutex);
+            BottomReady = y - 1 - SplitLine;
+            PublishLines();
+        }
+
+        if (!boundaryDone && TopHalfDone.load(std::memory_order_acquire))
+            finishBoundary();
+    }
+
+    ScanlineFinalPass(191);
+    {
+        std::lock_guard lock(PublishMutex);
+        BottomReady = 191 - SplitLine;
+        PublishLines();
+    }
+
+    if (!boundaryDone)
+    {
+        if (!SplitTookTopStencil)
+            Platform::Semaphore_Wait(Sema_TopHalfDone);
+        finishBoundary();
+    }
+}
+
+void SoftRenderer3D::SplitThreadFunc()
+{
+    for (;;)
+    {
+        Platform::Semaphore_Wait(Sema_SplitStart);
+        if (!SplitThreadRunning) return;
+
+        RenderBottomHalf();
+
+        Platform::Semaphore_Post(Sema_SplitDone);
+    }
 }
 
 void SoftRenderer3D::FinishRendering()

@@ -23,6 +23,7 @@
 #include "Platform.h"
 #include <thread>
 #include <atomic>
+#include <mutex>
 
 namespace melonDS
 {
@@ -37,6 +38,9 @@ public:
 
     void SetThreaded(bool threaded) noexcept;
     [[nodiscard]] bool IsThreaded() const noexcept { return Threaded; }
+
+    // with the render thread, rasterize the bottom half of the frame on a second thread
+    void SetSplit(bool split) noexcept;
 
     void RenderFrame() override;
     void FinishRendering() override;
@@ -445,21 +449,36 @@ private:
     };
 
     RendererPolygon PolygonList[2048];
+
+    // the per-thread rasterizer state: polygon edges, and the stencil buffer for shadows,
+    // which carries over between scanlines of the same parity
+    struct RasterContext
+    {
+        RendererPolygon* Polygons;
+        u8* StencilBuffer;
+        bool PrevIsShadowMask;
+    };
+
     void TextureLookup(u32 texparam, u32 texpal, s16 s, s16 t, u16* color, u8* alpha) const;
     u32 RenderPixel(const Polygon* polygon, u8 vr, u8 vg, u8 vb, s16 s, s16 t) const;
     void PlotTranslucentPixel(u32 pixeladdr, u32 color, u32 z, u32 polyattr, u32 shadow);
     void SetupPolygonLeftEdge(RendererPolygon* rp, s32 y) const;
     void SetupPolygonRightEdge(RendererPolygon* rp, s32 y) const;
     void SetupPolygon(RendererPolygon* rp, Polygon* polygon) const;
-    void RenderShadowMaskScanline(RendererPolygon* rp, s32 y);
-    void RenderPolygonScanline(RendererPolygon* rp, s32 y);
-    void RenderScanline(s32 y, int npolys);
+    void RenderShadowMaskScanline(RasterContext& ctx, RendererPolygon* rp, s32 y);
+    void RenderPolygonScanline(RasterContext& ctx, RendererPolygon* rp, s32 y);
+    void RenderScanline(RasterContext& ctx, s32 y, int npolys);
     u32 CalculateFogDensity(u32 pixeladdr) const;
     void ScanlineFinalPass(s32 y);
     void ClearBuffers();
     void RenderPolygons(bool threaded, Polygon** polygons, int npolys);
+    void RenderPolygonsSplit(Polygon** polygons, int npolys);
 
     void RenderThreadFunc();
+    void SplitThreadFunc();
+    void RenderBottomHalf();
+    void PublishLines();
+    bool BottomHalfNeedsTopStencil(bool& prevIsShadowMask, bool* stencilValid) const;
 
     // buffer dimensions are 258x194 to add a offscreen 1px border
     // which simplifies edge marking tests
@@ -510,5 +529,47 @@ private:
     // Used to allow the main thread to read some scanlines
     // before (the 3D portion of) the entire frame is rasterized.
     Platform::Semaphore* Sema_ScanlineCount;
+
+    /*
+        Split rendering
+
+        The render thread rasterizes scanlines 0..SplitLine-1 and does their final pass up to SplitLine-2,
+        while the split thread rasterizes SplitLine..191 with its own copy of the polygon edges, set up
+        directly at SplitLine. The final pass of a scanline reads its neighbours, so the split thread
+        does it for SplitLine-1 and SplitLine once the top half is done, and for its other scanlines as
+        it goes. If the bottom half's shadows would read stencil values left by the top half, the split
+        thread waits for the top half and takes its stencil state. Scanlines are handed to the main
+        thread in order, as soon as they are final.
+    */
+
+    static constexpr s32 SplitLine = 96;
+
+    bool Split = false;
+    Platform::Thread* SplitThread = nullptr;
+    std::atomic_bool SplitThreadRunning {false};
+    Platform::Semaphore* Sema_SplitStart;
+    Platform::Semaphore* Sema_SplitDone;
+    Platform::Semaphore* Sema_TopHalfDone;
+
+    Polygon** SplitPolygons = nullptr;
+    int SplitNumPolygons = 0;
+    bool SplitStartPrevIsShadowMask = false;
+    RendererPolygon SplitPolygonList[2048];
+    u8 SplitStencilBuffer[256*2];
+    RasterContext SplitContext;
+    RasterContext TopContext;
+    // which stencil parities the split thread cleared and wrote (only those are taken back at the end of the frame)
+    bool SplitStencilValid[2];
+    bool SplitTookTopStencil;
+
+    std::atomic_bool TopHalfDone {false};
+    std::mutex PublishMutex;
+    s32 TopReady = 0;       // scanlines 0..TopReady-1 are final
+    bool BoundaryReady = false;
+    s32 BottomReady = 0;    // with BoundaryReady, scanlines SplitLine+1..SplitLine+BottomReady are final
+    s32 LinesPublished = 0;
+
+    void StartSplitThread();
+    void StopSplitThread();
 };
 }

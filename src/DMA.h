@@ -41,7 +41,7 @@ public:
     void Start();
 
     u32 UnitTimings9_16(bool burststart);
-    u32 UnitTimings9_32(bool burststart);
+    [[gnu::always_inline]] inline u32 UnitTimings9_32(bool burststart);
     u32 UnitTimings7_16(bool burststart);
     u32 UnitTimings7_32(bool burststart);
 

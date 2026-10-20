@@ -110,6 +110,25 @@ public:
 
     void WriteToGXFIFO(u32 val) noexcept;
 
+    // a 32-bit write to the geometry FIFO or a command port (0x04000400 to 0x040005CB),
+    // the same as Write32 for those addresses but without going through the other registers
+    void WriteGeometry32(u32 addr, u32 val) noexcept
+    {
+        if (!GeometryEnabled) return;
+
+        if (addr < 0x04000440)
+        {
+            WriteToGXFIFO(val);
+        }
+        else
+        {
+            CmdFIFOEntry entry;
+            entry.Command = (addr & 0x1FC) >> 2;
+            entry.Param = val;
+            CmdFIFOWrite(entry);
+        }
+    }
+
     u8 Read8(u32 addr) noexcept;
     u16 Read16(u32 addr) noexcept;
     u32 Read32(u32 addr) noexcept;

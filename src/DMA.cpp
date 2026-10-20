@@ -593,7 +593,7 @@ void DMA::Run9()
             u32 val = ((srcaddr & 0xFF000000) == 0x02000000)
                 ? *(u32*)&NDS.MainRAM[srcaddr & NDS.MainRAMMask]
                 : NDS.ARM9Read32(CurSrcAddr);
-            NDS.GPU.GPU3D.Write32(dstaddr, val);
+            NDS.GPU.GPU3D.WriteGeometry32(dstaddr, val);
 
             CurSrcAddr += SrcAddrInc<<2;
             IterCount--;

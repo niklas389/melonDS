@@ -672,14 +672,6 @@ void SoftRenderer::VBlank()
         SyncCaptures(bank);
 
     CaptureImmediate = false;
-
-    // the 3D frame to be shown next is final now, apart from the texture memory
-    Early3DFrame = false;
-    if (Soft3D->IsThreaded())
-    {
-        StartFrame3D();
-        Early3DFrame = Soft3D->RenderFrameEarly();
-    }
 }
 
 void SoftRenderer::SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete)
@@ -693,16 +685,6 @@ void SoftRenderer::SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete)
 
 void SoftRenderer::Start3DRendering()
 {
-    // a frame started early is already in the buffer that the queued scanlines must not read
-    if (!Early3DFrame)
-        StartFrame3D();
-    Early3DFrame = false;
-
-    Rend3D->RenderFrame();
-}
-
-void SoftRenderer::StartFrame3D()
-{
     // queued scanlines may still read the 3D renderer's buffer, which the new frame overwrites;
     // rather than waiting for them, let them read a copy
     if (Threaded2D && JobsSubmitted.load(std::memory_order_relaxed) != JobsDone.load())
@@ -715,11 +697,12 @@ void SoftRenderer::StartFrame3D()
         // only the scanline in progress may have taken the old address
         WaitForJobs(JobsStarted.load());
     }
+
+    Rend3D->RenderFrame();
 }
 
 void SoftRenderer::Restart3DRendering()
 {
-    Early3DFrame = false;
     WaitIdle();
     Rend3D->RestartFrame();
 }
